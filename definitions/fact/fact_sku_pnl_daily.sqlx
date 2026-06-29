@@ -1,0 +1,161 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.fact_dataset,
+  description: "Fact P&L by SKU daily — MERGE từ 4 nguồn. Grain: brand × channel × sku × day. Chưa có COGS và Cost Allocation Engine.",
+  tags: ["fact", "daily"],
+  uniqueKey: ["brand", "channel", "sku", "day"],
+  bigquery: {
+    partitionBy: "day",
+    clusterBy: ["channel", "sku"],
+    updatePartitionFilter: "day >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)"
+  }
+}
+
+-- lookback 35 ngày để bắt kịp settlement post trễ + buffer nếu job fail vài ngày
+
+DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY);
+
+WITH revenue_agg AS (
+  SELECT
+    brand,
+    'Amazon'    AS channel,
+    sku,
+    order_date  AS day,
+    SUM(quantity)                                                        AS units_sold,
+    SUM(COALESCE(net_item_revenue, 0))                                   AS gross_revenue,
+    SUM(COALESCE(shipping_price, 0))                                     AS shipping_revenue,
+    SUM(COALESCE(item_tax, 0) + COALESCE(shipping_tax, 0))               AS tax_collected,
+    SUM(COALESCE(item_promotion_discount, 0)
+      + COALESCE(ship_promotion_discount, 0))                            AS promotion_discount,
+    COUNTIF(fulfillment_channel = 'Amazon')                              AS fba_item_count,
+    COUNTIF(fulfillment_channel = 'Merchant')                            AS fbm_item_count,
+    COUNTIF(is_pending_price_missing)                                    AS pending_price_missing_count
+  FROM ${ref("stg_amazon_orders")}
+  WHERE order_date >= target_date_start
+  GROUP BY brand, sku, order_date
+),
+
+fees_agg AS (
+  SELECT
+    brand,
+    'Amazon'     AS channel,
+    sku,
+    posted_date  AS day,
+    SUM(IF(amount_description = 'Commission', amount, 0))                AS commission_fee,
+    SUM(IF(amount_description LIKE 'FBA%Fulfillment%', amount, 0))       AS fba_fulfillment_fee,
+    SUM(IF(amount_description LIKE '%Storage%', amount, 0))              AS storage_fee,
+    SUM(IF(amount_description LIKE '%Refund%'
+      OR transaction_type = 'Refund', amount, 0))                       AS refund_amount,
+    SUM(IF(
+      amount_description NOT IN ('Commission')
+      AND amount_description NOT LIKE 'FBA%Fulfillment%'
+      AND amount_description NOT LIKE '%Storage%'
+      AND amount_description NOT LIKE '%Refund%'
+      AND transaction_type != 'Refund',
+      amount, 0))                                                        AS other_fees,
+    SUM(amount)                                                          AS total_settlement_amount
+  FROM ${ref("stg_amazon_settlement")}
+  WHERE posted_date >= target_date_start
+  GROUP BY brand, sku, posted_date
+),
+
+ads_agg AS (
+  SELECT
+    brand,
+    'Amazon'     AS channel,
+    sku,
+    report_date  AS day,
+    SUM(impressions)          AS ad_impressions,
+    SUM(clicks)               AS ad_clicks,
+    SUM(ad_cost)              AS ad_spend,
+    SUM(purchases_14d)        AS ad_attributed_purchases,
+    SUM(attributed_sales_14d) AS ad_attributed_sales
+  FROM ${ref("stg_amazon_ads")}
+  WHERE report_date >= target_date_start
+  GROUP BY brand, sku, report_date
+),
+
+returns_agg AS (
+  SELECT
+    brand,
+    'Amazon'    AS channel,
+    sku,
+    return_date AS day,
+    SUM(COALESCE(quantity, 0)) AS units_returned
+  FROM ${ref("stg_amazon_returns")}
+  WHERE return_date >= target_date_start
+  GROUP BY brand, sku, return_date
+),
+
+combined AS (
+  SELECT
+    COALESCE(r.brand, f.brand, a.brand, rt.brand)         AS brand,
+    COALESCE(r.channel, f.channel, a.channel, rt.channel) AS channel,
+    COALESCE(r.sku, f.sku, a.sku, rt.sku)                 AS sku,
+    COALESCE(r.day, f.day, a.day, rt.day)                 AS day,
+    r.units_sold,
+    r.gross_revenue,
+    r.shipping_revenue,
+    r.tax_collected,
+    r.promotion_discount,
+    r.fba_item_count,
+    r.fbm_item_count,
+    r.pending_price_missing_count,
+    f.commission_fee,
+    f.fba_fulfillment_fee,
+    f.storage_fee,
+    f.refund_amount,
+    f.other_fees,
+    f.total_settlement_amount,
+    a.ad_impressions,
+    a.ad_clicks,
+    a.ad_spend,
+    a.ad_attributed_purchases,
+    a.ad_attributed_sales,
+    rt.units_returned
+  FROM revenue_agg r
+  FULL OUTER JOIN fees_agg   f  ON r.brand = f.brand  AND r.sku = f.sku  AND r.day = f.day
+  FULL OUTER JOIN ads_agg    a  ON COALESCE(r.brand, f.brand) = a.brand
+                                AND COALESCE(r.sku, f.sku) = a.sku
+                                AND COALESCE(r.day, f.day) = a.day
+  FULL OUTER JOIN returns_agg rt ON COALESCE(r.brand, f.brand, a.brand) = rt.brand
+                                 AND COALESCE(r.sku, f.sku, a.sku) = rt.sku
+                                 AND COALESCE(r.day, f.day, a.day) = rt.day
+)
+
+SELECT
+  brand,
+  channel,
+  sku,
+  day,
+  COALESCE(units_sold, 0)                AS units_sold,
+  COALESCE(gross_revenue, 0)             AS gross_revenue,
+  COALESCE(shipping_revenue, 0)          AS shipping_revenue,
+  COALESCE(tax_collected, 0)             AS tax_collected,
+  COALESCE(promotion_discount, 0)        AS promotion_discount,
+  COALESCE(fba_item_count, 0)            AS fba_item_count,
+  COALESCE(fbm_item_count, 0)            AS fbm_item_count,
+  COALESCE(pending_price_missing_count, 0) AS pending_price_missing_count,
+  COALESCE(commission_fee, 0)            AS commission_fee,
+  COALESCE(fba_fulfillment_fee, 0)       AS fba_fulfillment_fee,
+  COALESCE(storage_fee, 0)               AS storage_fee,
+  COALESCE(refund_amount, 0)             AS refund_amount,
+  COALESCE(other_fees, 0)                AS other_fees,
+  COALESCE(total_settlement_amount, 0)   AS total_settlement_amount,
+  COALESCE(ad_impressions, 0)            AS ad_impressions,
+  COALESCE(ad_clicks, 0)                 AS ad_clicks,
+  COALESCE(ad_spend, 0)                  AS ad_spend,
+  COALESCE(ad_attributed_purchases, 0)   AS ad_attributed_purchases,
+  COALESCE(ad_attributed_sales, 0)       AS ad_attributed_sales,
+  COALESCE(units_returned, 0)            AS units_returned,
+  -- channel_contribution_margin_pre_cogs: chưa trừ COGS (Nhà Máy 5)
+  (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
+    - COALESCE(commission_fee, 0) * -1
+    - COALESCE(fba_fulfillment_fee, 0) * -1
+    - COALESCE(storage_fee, 0) * -1
+    - COALESCE(ad_spend, 0))             AS channel_contribution_margin_pre_cogs,
+  CURRENT_TIMESTAMP()                    AS _transformed_at
+FROM combined
+WHERE sku IS NOT NULL AND day IS NOT NULL
+
+${ when(incremental(), `WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)`) }

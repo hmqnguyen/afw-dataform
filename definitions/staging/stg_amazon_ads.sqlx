@@ -1,0 +1,47 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging ads — dedupe theo (report_date, sku, campaign_id, ad_group_id). Không lưu metadata.",
+  tags: ["staging", "daily"],
+  bigquery: {
+    partitionBy: "report_date",
+    clusterBy: ["sku"]
+  }
+}
+
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY report_date, sku, campaign_id, ad_group_id
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM ${ref("flat_amazon_ads")}
+  WHERE sku IS NOT NULL AND sku != ''
+    AND report_date IS NOT NULL
+)
+SELECT
+  brand,
+  report_date,
+  campaign_id,
+  campaign_name,
+  campaign_status,
+  campaign_budget,
+  campaign_budget_type,
+  ad_group_id,
+  ad_group_name,
+  sku,
+  asin,
+  impressions,
+  clicks,
+  ad_cost,
+  purchases_14d,
+  attributed_sales_14d,
+  units_sold_14d,
+  conversions_14d,
+  ctr,
+  cpc,
+  cost_per_purchase,
+  roas
+FROM ranked
+WHERE rn = 1

@@ -1,0 +1,61 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging orders — dedupe theo order_item_id. Không lưu metadata.",
+  tags: ["staging", "daily"],
+  bigquery: {
+    partitionBy: "order_date",
+    clusterBy: ["sku"]
+  }
+}
+
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY order_item_id
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM ${ref("flat_amazon_orders")}
+  WHERE order_item_id IS NOT NULL AND order_item_id != ''
+    AND sku IS NOT NULL AND sku != ''
+    AND order_status != 'Canceled'
+)
+SELECT
+  brand,
+  amazon_order_id,
+  merchant_order_id,
+  order_item_id,
+  purchase_date,
+  last_updated_date,
+  order_date,
+  order_status,
+  item_status,
+  fulfillment_channel,
+  sales_channel,
+  order_channel,
+  ship_service_level,
+  product_title,
+  sku,
+  asin,
+  quantity,
+  currency_code,
+  item_price,
+  item_tax,
+  shipping_price,
+  shipping_tax,
+  gift_wrap_price,
+  item_promotion_discount,
+  ship_promotion_discount,
+  net_item_revenue,
+  ship_to_state,
+  ship_to_city,
+  ship_to_postal_code,
+  ship_to_country,
+  is_business_order,
+  is_pending_price_missing,
+  COUNTIF(is_pending_price_missing) OVER (
+    PARTITION BY brand, sku, order_date
+  ) AS pending_price_missing_count
+FROM ranked
+WHERE rn = 1

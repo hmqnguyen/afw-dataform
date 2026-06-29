@@ -1,0 +1,40 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging returns — dedupe theo (order_id, sku, return_date_raw, rma_id). Không lưu metadata.",
+  tags: ["staging", "daily"],
+  bigquery: {
+    partitionBy: "return_date",
+    clusterBy: ["sku"]
+  }
+}
+
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY amazon_order_id, sku, return_date_raw, COALESCE(rma_id, '')
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM ${ref("flat_amazon_returns")}
+  WHERE sku IS NOT NULL AND sku != ''
+)
+SELECT
+  brand,
+  amazon_order_id,
+  order_item_id,
+  rma_id,
+  sku,
+  asin,
+  quantity,
+  return_date_raw,
+  return_timestamp,
+  return_date,
+  return_reason,
+  return_status,
+  resolution,
+  fulfillment_center_id,
+  label_type,
+  label_cost
+FROM ranked
+WHERE rn = 1

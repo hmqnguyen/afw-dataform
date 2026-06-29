@@ -1,0 +1,27 @@
+defaultProject: allforwood-dev
+defaultDataset: afw_amazon_fact_dev
+defaultLocation: us-central1
+defaultAssertionDataset: afw_amazon_fact_dev
+
+# LƯU Ý: file này dùng cho môi trường DEV (allforwood-dev).
+# Khi deploy prod, đổi defaultProject + defaultDataset + vars sang allforwood.
+#
+# vars được đọc bởi sources.js và các SQLX file để biết đúng dataset
+# của từng layer trong từng môi trường.
+#
+# Mapping dataset DEV:
+#   raw     → afw_amazon_raw_dev     (C# ghi vào, Dataform chỉ đọc)
+#   flat    → afw_amazon_flat_dev
+#   staging → afw_amazon_staging_dev
+#   fact    → afw_amazon_fact_dev
+#
+# Location: us-central1 phải khớp với Dataform repository region.
+# BigQuery dataset ở US multi-region — us-central1 nằm trong US, tương thích.
+
+vars:
+  raw_dataset: afw_amazon_raw_dev
+  flat_dataset: afw_amazon_flat_dev
+  staging_dataset: afw_amazon_staging_dev
+  fact_dataset: afw_amazon_fact_dev
+
+dataformCoreVersion: 3.0.0

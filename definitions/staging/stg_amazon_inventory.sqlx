@@ -1,0 +1,46 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging inventory — snapshot mới nhất per (snapshot_date, sku). Không lưu metadata.",
+  tags: ["staging", "daily"],
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["sku"]
+  }
+}
+
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY snapshot_date, sku
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM ${ref("flat_amazon_inventory")}
+  WHERE sku IS NOT NULL AND sku != ''
+)
+SELECT
+  brand,
+  snapshot_date,
+  sku,
+  asin,
+  fnsku,
+  product_name,
+  condition,
+  total_quantity,
+  fulfillable_quantity,
+  inbound_working_quantity,
+  inbound_shipped_quantity,
+  inbound_receiving_quantity,
+  reserved_quantity,
+  reserved_pending_customer_order,
+  reserved_pending_transshipment,
+  unfulfillable_quantity,
+  unfulfillable_customer_damaged,
+  unfulfillable_warehouse_damaged,
+  unfulfillable_distributor_damaged,
+  unfulfillable_carrier_damaged,
+  unfulfillable_defective,
+  unfulfillable_expired
+FROM ranked
+WHERE rn = 1

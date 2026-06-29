@@ -1,0 +1,56 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging settlement — dedupe 7 cột composite key. Không lưu metadata.",
+  tags: ["staging", "daily"],
+  bigquery: {
+    partitionBy: "posted_date",
+    clusterBy: ["sku", "amount_type"]
+  }
+}
+
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        settlement_id,
+        amazon_order_id,
+        sku,
+        amount_type,
+        amount_description,
+        CAST(amount AS STRING),
+        posted_date_time
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM ${ref("flat_amazon_settlement")}
+  WHERE sku IS NOT NULL AND sku != ''
+)
+SELECT
+  brand,
+  settlement_id,
+  amazon_order_id,
+  merchant_order_id,
+  adjustment_id,
+  shipment_id,
+  order_item_code,
+  merchant_order_item_id,
+  merchant_adjustment_item_id,
+  sku,
+  quantity_purchased,
+  promotion_id,
+  marketplace_name,
+  fulfillment_id,
+  transaction_type,
+  amount_type,
+  amount_description,
+  currency_code,
+  amount,
+  total_amount,
+  settlement_start_date,
+  settlement_end_date,
+  posted_date,
+  posted_date_time,
+  deposit_date
+FROM ranked
+WHERE rn = 1
