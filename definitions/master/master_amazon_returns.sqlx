@@ -10,14 +10,46 @@ config {
   }
 }
 
--- CÁCH HOẠT ĐỘNG:
---   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn
---   bộ stg_amazon_returns.
+-- LƯU Ý QUAN TRỌNG (đã xác nhận thật qua lỗi runtime ở master_amazon_
+-- settlement.sqlx — cùng pattern nên fix giống nhau): incremental() có
+-- thể trả về true (compile ra LEFT JOIN ${self()}) NGAY CẢ KHI bảng đích
+-- chưa từng được tạo. pre_operations dưới đây CHỦ ĐỘNG tạo bảng rỗng
+-- (đúng schema) TRƯỚC khi câu SELECT chính chạy — đảm bảo ${self()} luôn
+-- trỏ tới 1 bảng tồn tại thật.
+pre_operations {
+  CREATE TABLE IF NOT EXISTS ${self()} (
+    brand                  STRING,
+    amazon_order_id        STRING,
+    order_item_id          STRING,
+    rma_id                 STRING,
+    sku                    STRING,
+    asin                   STRING,
+    quantity               INT64,
+    return_date_raw        STRING,
+    return_timestamp       TIMESTAMP,
+    return_date            DATE,
+    return_reason          STRING,
+    return_status          STRING,
+    resolution              STRING,
+    fulfillment_center_id   STRING,
+    label_type              STRING,
+    label_cost               NUMERIC,
+    _ingested_at             TIMESTAMP
+  )
+  PARTITION BY return_date
+  CLUSTER BY sku
+}
+
+-- CÁCH HOẠT ĐỘNG (sau khi có pre_operations ở trên):
+--   Lần đầu chạy: pre_operations tạo bảng rỗng → câu SELECT chính chạy,
+--   LEFT JOIN vào bảng rỗng đó → mọi dòng từ stg_amazon_returns đều "chưa
+--   có trong master" → toàn bộ được INSERT.
 --
---   Từ lần 2 trở đi (incremental): chỉ đưa vào MERGE những return_item mà
---   _ingested_at MỚI HƠN bản đang lưu trong master, hoặc chưa từng có.
---   Lần trả hàng không đổi (status/resolution giữ nguyên giữa các lần
---   sync) sẽ không xuất hiện trong USING clause → giữ nguyên 100%.
+--   Từ lần 2 trở đi: pre_operations thấy bảng đã tồn tại → bỏ qua (IF NOT
+--   EXISTS) → chỉ đưa vào MERGE những return_item mà _ingested_at MỚI
+--   HƠN bản đang lưu trong master, hoặc chưa từng có. Lần trả hàng không
+--   đổi (status/resolution giữ nguyên giữa các lần sync) sẽ không xuất
+--   hiện trong USING clause → giữ nguyên 100%.
 --
 -- LƯU Ý: rma_id có thể NULL (Amazon không phải lúc nào cũng trả RMA ID) —
 -- dùng COALESCE(rma_id, '') trong điều kiện so sánh để JOIN không bị bỏ

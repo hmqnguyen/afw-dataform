@@ -10,11 +10,59 @@ config {
   }
 }
 
--- CÁCH HOẠT ĐỘNG:
---   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn bộ
---   stg_amazon_orders — không có self-join vì bảng chưa tồn tại.
+-- LƯU Ý QUAN TRỌNG (đã xác nhận thật ở master_amazon_settlement.sqlx —
+-- cùng pattern incremental + self-join nên áp dụng fix tương tự để
+-- phòng ngừa, kể cả khi file này đã từng chạy thành công ở dev): trong
+-- vài trường hợp incremental() có thể trả về true (compile ra LEFT JOIN
+-- ${self()}) NGAY CẢ KHI bảng đích chưa từng được tạo — ví dụ khi deploy
+-- lần đầu ở môi trường mới (prod). pre_operations dưới đây CHỦ ĐỘNG tạo
+-- bảng rỗng (đúng schema) TRƯỚC khi câu SELECT chính chạy — đảm bảo
+-- ${self()} luôn trỏ tới 1 bảng tồn tại thật, bất kể môi trường nào.
+pre_operations {
+  CREATE TABLE IF NOT EXISTS ${self()} (
+    brand                       STRING,
+    amazon_order_id              STRING,
+    merchant_order_id            STRING,
+    order_item_id                STRING,
+    purchase_date                 TIMESTAMP,
+    last_updated_date              TIMESTAMP,
+    order_date                      DATE,
+    order_status                     STRING,
+    item_status                       STRING,
+    fulfillment_channel                STRING,
+    sales_channel                       STRING,
+    order_channel                        STRING,
+    ship_service_level                    STRING,
+    product_title                          STRING,
+    sku                                     STRING,
+    asin                                    STRING,
+    quantity                                INT64,
+    currency_code                           STRING,
+    item_price                              NUMERIC,
+    item_tax                                NUMERIC,
+    shipping_price                          NUMERIC,
+    shipping_tax                            NUMERIC,
+    gift_wrap_price                         NUMERIC,
+    item_promotion_discount                 NUMERIC,
+    ship_promotion_discount                 NUMERIC,
+    net_item_revenue                        NUMERIC,
+    ship_to_state                           STRING,
+    ship_to_city                            STRING,
+    ship_to_postal_code                     STRING,
+    ship_to_country                         STRING,
+    is_business_order                       BOOL,
+    is_pending_price_missing                BOOL
+  )
+  PARTITION BY order_date
+  CLUSTER BY sku
+}
+
+-- CÁCH HOẠT ĐỘNG (sau khi có pre_operations ở trên):
+--   Lần đầu chạy: pre_operations tạo bảng rỗng → câu SELECT chính chạy,
+--   LEFT JOIN vào bảng rỗng đó → mọi order_item_id đều "chưa có trong
+--   master" → toàn bộ được INSERT.
 --
---   Từ lần 2 trở đi (incremental, bảng đã tồn tại): Dataform tự generate
+--   Từ lần 2 trở đi (incremental, bảng đã có data): Dataform tự generate
 --     MERGE master_amazon_orders T
 --     USING (<câu SELECT dưới đây>) S
 --     ON T.order_item_id = S.order_item_id

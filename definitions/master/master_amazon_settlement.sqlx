@@ -13,13 +13,58 @@ config {
   }
 }
 
--- CÁCH HOẠT ĐỘNG:
---   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn
---   bộ stg_amazon_settlement.
+-- LƯU Ý QUAN TRỌNG (đã xác nhận thật qua lỗi runtime): incremental() có
+-- thể trả về true (compile ra LEFT JOIN ${self()}) NGAY CẢ KHI bảng đích
+-- chưa từng được tạo — đây là edge-case đã biết của Dataform khi action
+-- đã có trong dependency graph nhưng chưa từng chạy thành công lần nào.
+-- Hậu quả: "Not found: Table ... was not found in location US".
 --
---   Từ lần 2 trở đi (incremental): chỉ đưa vào MERGE những giao dịch CHƯA
---   từng có trong master (theo composite key). Giao dịch đã có → KHÔNG xuất
---   hiện trong USING clause → MERGE không động vào → giữ nguyên 100%.
+-- pre_operations dưới đây CHỦ ĐỘNG tạo bảng rỗng (đúng schema) TRƯỚC khi
+-- câu SELECT chính chạy — đảm bảo ${self()} luôn trỏ tới 1 bảng tồn tại
+-- thật, bất kể incremental() đánh giá đúng hay sai. Đây là cách giải
+-- quyết triệt để, tự động hoàn toàn — không cần đổi type thủ công hay
+-- chạy full-refresh riêng cho lần đầu.
+pre_operations {
+  CREATE TABLE IF NOT EXISTS ${self()} (
+    brand                         STRING,
+    settlement_id                 STRING,
+    amazon_order_id               STRING,
+    merchant_order_id             STRING,
+    adjustment_id                 STRING,
+    shipment_id                   STRING,
+    order_item_code               STRING,
+    merchant_order_item_id        STRING,
+    merchant_adjustment_item_id   STRING,
+    sku                           STRING,
+    quantity_purchased            INT64,
+    promotion_id                  STRING,
+    marketplace_name              STRING,
+    fulfillment_id                STRING,
+    transaction_type              STRING,
+    amount_type                   STRING,
+    amount_description            STRING,
+    currency_code                 STRING,
+    amount                        NUMERIC,
+    total_amount                  NUMERIC,
+    settlement_start_date         DATE,
+    settlement_end_date           DATE,
+    posted_date                   DATE,
+    posted_date_time              TIMESTAMP,
+    deposit_date                  DATE
+  )
+  PARTITION BY posted_date
+  CLUSTER BY sku, amount_type
+}
+
+-- CÁCH HOẠT ĐỘNG (sau khi có pre_operations ở trên):
+--   Lần đầu chạy: pre_operations tạo bảng rỗng → câu SELECT chính chạy,
+--   LEFT JOIN vào bảng rỗng đó → mọi dòng từ stg_amazon_settlement đều
+--   "chưa có trong master" → toàn bộ được INSERT.
+--
+--   Từ lần 2 trở đi: pre_operations thấy bảng đã tồn tại → bỏ qua (IF NOT
+--   EXISTS) → chỉ đưa vào MERGE những giao dịch CHƯA từng có trong master
+--   (theo composite key). Giao dịch đã có → KHÔNG xuất hiện trong USING
+--   clause → MERGE không động vào → giữ nguyên 100%.
 --
 --   KHÁC master_amazon_orders: KHÔNG có điều kiện "mới hơn" vì settlement
 --   không có cột nghiệp vụ nào biểu thị "Amazon đã sửa lại giao dịch này"
