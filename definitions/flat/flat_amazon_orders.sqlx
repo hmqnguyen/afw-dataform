@@ -18,13 +18,19 @@ SELECT
   JSON_VALUE(raw_payload, '$."order-item-id"')            AS order_item_id,
 
   -- Thời gian
+  -- LƯU Ý: dùng SAFE_CAST(... AS TIMESTAMP) thay vì PARSE_TIMESTAMP với
+  -- format string %Ez — %Ez khi PARSE (không phải FORMAT) đòi hỏi offset
+  -- dạng +0000 (không dấu hai chấm), nhưng Amazon trả về ISO 8601 chuẩn
+  -- "+00:00" (có dấu hai chấm) → PARSE_TIMESTAMP với %Ez fail âm thầm,
+  -- trả NULL. SAFE_CAST AS TIMESTAMP nhận diện đúng mọi format ISO 8601
+  -- (kể cả "+00:00", "Z", "+07:00", ...) nên an toàn hơn nhiều.
   JSON_VALUE(raw_payload, '$."purchase-date"')            AS purchase_date_raw,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez',
-    JSON_VALUE(raw_payload, '$."purchase-date"'))          AS purchase_date,
-  DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez',
-    JSON_VALUE(raw_payload, '$."purchase-date"')))         AS order_date,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez',
-    JSON_VALUE(raw_payload, '$."last-updated-date"'))      AS last_updated_date,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$."purchase-date"') AS TIMESTAMP)
+                                                           AS purchase_date,
+  DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."purchase-date"') AS TIMESTAMP))
+                                                           AS order_date,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$."last-updated-date"') AS TIMESTAMP)
+                                                           AS last_updated_date,
 
   -- Trạng thái
   JSON_VALUE(raw_payload, '$."order-status"')             AS order_status,

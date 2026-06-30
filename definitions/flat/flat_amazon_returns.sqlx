@@ -23,11 +23,14 @@ SELECT
   SAFE_CAST(JSON_VALUE(raw_payload, '$.quantity') AS INT64) AS quantity,
 
   -- Thời gian
+  -- SAFE_CAST AS TIMESTAMP thay vì PARSE_TIMESTAMP %Ez — lý do xem
+  -- flat_amazon_orders.sqlx (offset "+00:00" có dấu hai chấm khiến %Ez
+  -- parse fail âm thầm, trả NULL toàn bộ).
   JSON_VALUE(raw_payload, '$."return-date"')               AS return_date_raw,
-  PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez',
-    JSON_VALUE(raw_payload, '$."return-date"'))             AS return_timestamp,
-  DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S%Ez',
-    JSON_VALUE(raw_payload, '$."return-date"')))            AS return_date,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP)
+                                                            AS return_timestamp,
+  DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP))
+                                                            AS return_date,
 
   -- Lý do & trạng thái
   JSON_VALUE(raw_payload, '$."return-reason"')             AS return_reason,

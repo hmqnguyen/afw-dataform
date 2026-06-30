@@ -56,14 +56,19 @@ SELECT
   ) AS total_amount,
 
   -- Thời gian
+  -- posted-date-time format chính thức Amazon: "YYYY-MM-DD HH:MM:SS UTC"
+  -- (có chữ UTC ở cuối). SAFE_CAST AS TIMESTAMP tự nhận diện được hậu tố
+  -- " UTC" — an toàn hơn PARSE_TIMESTAMP với format string cố định, vì
+  -- format string phải khớp chính xác từng ký tự (bao gồm cả "UTC" dư ra
+  -- nếu không khai báo trong pattern).
   PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10))
                                                             AS settlement_start_date,
   PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10))
                                                             AS settlement_end_date,
-  DATE(PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S',
-    JSON_VALUE(raw_payload, '$."posted-date-time"')))       AS posted_date,
-  PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S',
-    JSON_VALUE(raw_payload, '$."posted-date-time"'))        AS posted_date_time,
+  DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP))
+                                                            AS posted_date,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP)
+                                                            AS posted_date_time,
   SAFE.PARSE_DATE('%Y-%m-%d',
     SUBSTR(JSON_VALUE(raw_payload, '$."deposit-date"'), 1, 10))
                                                             AS deposit_date,
