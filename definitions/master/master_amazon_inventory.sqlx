@@ -1,0 +1,55 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master inventory — giữ lại snapshot tồn kho theo TỪNG NGÀY (không bị xóa làm lại như staging). Trong cùng 1 ngày, nhiều lần sync sẽ GHI ĐÈ lên nhau (chỉ giữ bản mới nhất của ngày đó). Qua ngày khác, snapshot cũ được giữ lại như 1 version lịch sử riêng.",
+  tags: ["master", "daily"],
+  uniqueKey: ["snapshot_date", "sku"],
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["sku"]
+  }
+}
+
+-- CÁCH HOẠT ĐỘNG:
+--   uniqueKey = (snapshot_date, sku) — khác Orders/Settlement/Returns,
+--   KHÔNG cần điều kiện UPDATE phụ (không cần so sánh "mới hơn") vì chính
+--   uniqueKey đã quyết định ghi đè hay giữ lại:
+--
+--   - Cùng snapshot_date + cùng sku → MATCHED → UPDATE (ghi đè, vì đây là
+--     2 lần sync trong CÙNG 1 NGÀY, chỉ cần giữ bản mới nhất của ngày đó)
+--   - snapshot_date khác (qua ngày mới) → NOT MATCHED → INSERT (tạo
+--     version mới, snapshot ngày cũ được giữ lại nguyên vẹn trong bảng)
+--
+-- Vì vậy KHÔNG cần when(incremental()) với điều kiện lọc phức tạp như 3
+-- bảng master khác — để Dataform tự xử lý toàn bộ qua uniqueKey, đơn giản
+-- và đúng ý nghĩa "version theo ngày, ghi đè trong ngày" mà không cần viết
+-- thêm logic so sánh thời gian.
+
+SELECT
+  brand,
+  snapshot_date,
+  sku,
+  asin,
+  fnsku,
+  product_name,
+  condition,
+  total_quantity,
+  fulfillable_quantity,
+  inbound_working_quantity,
+  inbound_shipped_quantity,
+  inbound_receiving_quantity,
+  reserved_quantity,
+  reserved_pending_customer_order,
+  reserved_pending_transshipment,
+  unfulfillable_quantity,
+  unfulfillable_customer_damaged,
+  unfulfillable_warehouse_damaged,
+  unfulfillable_distributor_damaged,
+  unfulfillable_carrier_damaged,
+  unfulfillable_defective,
+  unfulfillable_expired
+FROM ${ref("stg_amazon_inventory")}
+
+${ when(incremental(),
+  `WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)`
+) }

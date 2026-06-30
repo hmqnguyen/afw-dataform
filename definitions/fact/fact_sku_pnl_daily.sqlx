@@ -1,7 +1,7 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.fact_dataset,
-  description: "Fact P&L by SKU daily — MERGE từ 4 nguồn. Grain: brand × channel × sku × day. Chưa có COGS và Cost Allocation Engine.",
+  description: "Fact P&L by SKU daily — MERGE từ 3 nguồn (Orders, Settlement, Returns). Grain: brand × channel × sku × day. Ads TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily) — xem README để biết cách JOIN cross-project nếu cần P&L có Ads. Chưa có COGS và Cost Allocation Engine.",
   tags: ["fact", "daily"],
   uniqueKey: ["brand", "channel", "sku", "day"],
   bigquery: {
@@ -12,6 +12,12 @@ config {
 }
 
 -- lookback 35 ngày để bắt kịp settlement post trễ + buffer nếu job fail vài ngày
+--
+-- LƯU Ý: Ads (ad_spend, ad_impressions, ad_clicks, ad_attributed_*) đã
+-- TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily),
+-- vì AdsSync (C#) cũng tách thành solution riêng. Bảng này KHÔNG còn
+-- ad_agg CTE — nếu cần P&L có Ads, JOIN cross-project thủ công (xem
+-- README của AfwAdsDataform).
 
 DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY);
 
@@ -59,22 +65,6 @@ fees_agg AS (
   GROUP BY brand, sku, posted_date
 ),
 
-ads_agg AS (
-  SELECT
-    brand,
-    'Amazon'     AS channel,
-    sku,
-    report_date  AS day,
-    SUM(impressions)          AS ad_impressions,
-    SUM(clicks)               AS ad_clicks,
-    SUM(ad_cost)              AS ad_spend,
-    SUM(purchases_14d)        AS ad_attributed_purchases,
-    SUM(attributed_sales_14d) AS ad_attributed_sales
-  FROM ${ref("stg_amazon_ads")}
-  WHERE report_date >= target_date_start
-  GROUP BY brand, sku, report_date
-),
-
 returns_agg AS (
   SELECT
     brand,
@@ -89,10 +79,10 @@ returns_agg AS (
 
 combined AS (
   SELECT
-    COALESCE(r.brand, f.brand, a.brand, rt.brand)         AS brand,
-    COALESCE(r.channel, f.channel, a.channel, rt.channel) AS channel,
-    COALESCE(r.sku, f.sku, a.sku, rt.sku)                 AS sku,
-    COALESCE(r.day, f.day, a.day, rt.day)                 AS day,
+    COALESCE(r.brand, f.brand, rt.brand)         AS brand,
+    COALESCE(r.channel, f.channel, rt.channel)   AS channel,
+    COALESCE(r.sku, f.sku, rt.sku)                AS sku,
+    COALESCE(r.day, f.day, rt.day)                AS day,
     r.units_sold,
     r.gross_revenue,
     r.shipping_revenue,
@@ -107,20 +97,12 @@ combined AS (
     f.refund_amount,
     f.other_fees,
     f.total_settlement_amount,
-    a.ad_impressions,
-    a.ad_clicks,
-    a.ad_spend,
-    a.ad_attributed_purchases,
-    a.ad_attributed_sales,
     rt.units_returned
   FROM revenue_agg r
   FULL OUTER JOIN fees_agg   f  ON r.brand = f.brand  AND r.sku = f.sku  AND r.day = f.day
-  FULL OUTER JOIN ads_agg    a  ON COALESCE(r.brand, f.brand) = a.brand
-                                AND COALESCE(r.sku, f.sku) = a.sku
-                                AND COALESCE(r.day, f.day) = a.day
-  FULL OUTER JOIN returns_agg rt ON COALESCE(r.brand, f.brand, a.brand) = rt.brand
-                                 AND COALESCE(r.sku, f.sku, a.sku) = rt.sku
-                                 AND COALESCE(r.day, f.day, a.day) = rt.day
+  FULL OUTER JOIN returns_agg rt ON COALESCE(r.brand, f.brand) = rt.brand
+                                 AND COALESCE(r.sku, f.sku) = rt.sku
+                                 AND COALESCE(r.day, f.day) = rt.day
 )
 
 SELECT
@@ -142,18 +124,13 @@ SELECT
   COALESCE(refund_amount, 0)             AS refund_amount,
   COALESCE(other_fees, 0)                AS other_fees,
   COALESCE(total_settlement_amount, 0)   AS total_settlement_amount,
-  COALESCE(ad_impressions, 0)            AS ad_impressions,
-  COALESCE(ad_clicks, 0)                 AS ad_clicks,
-  COALESCE(ad_spend, 0)                  AS ad_spend,
-  COALESCE(ad_attributed_purchases, 0)   AS ad_attributed_purchases,
-  COALESCE(ad_attributed_sales, 0)       AS ad_attributed_sales,
   COALESCE(units_returned, 0)            AS units_returned,
-  -- channel_contribution_margin_pre_cogs: chưa trừ COGS (Nhà Máy 5)
+  -- channel_contribution_margin_pre_cogs: CHƯA trừ COGS (Nhà Máy 5) và
+  -- CHƯA trừ ad_spend (Ads đã tách project riêng — xem AfwAdsDataform)
   (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
     - COALESCE(commission_fee, 0) * -1
     - COALESCE(fba_fulfillment_fee, 0) * -1
-    - COALESCE(storage_fee, 0) * -1
-    - COALESCE(ad_spend, 0))             AS channel_contribution_margin_pre_cogs,
+    - COALESCE(storage_fee, 0) * -1)     AS channel_contribution_margin_pre_cogs,
   CURRENT_TIMESTAMP()                    AS _transformed_at
 FROM combined
 WHERE sku IS NOT NULL AND day IS NOT NULL

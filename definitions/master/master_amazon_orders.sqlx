@@ -1,0 +1,70 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master orders — giữ lại TẤT CẢ order_item_id đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy (khác stg_amazon_orders). Mỗi lần chạy: order mới → INSERT, order đã có → UPDATE chỉ khi last_updated_date mới hơn bản đang lưu.",
+  tags: ["master", "daily"],
+  uniqueKey: ["order_item_id"],
+  bigquery: {
+    partitionBy: "order_date",
+    clusterBy: ["sku"]
+  }
+}
+
+-- CÁCH HOẠT ĐỘNG:
+--   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn bộ
+--   stg_amazon_orders — không có self-join vì bảng chưa tồn tại.
+--
+--   Từ lần 2 trở đi (incremental, bảng đã tồn tại): Dataform tự generate
+--     MERGE master_amazon_orders T
+--     USING (<câu SELECT dưới đây>) S
+--     ON T.order_item_id = S.order_item_id
+--     WHEN MATCHED THEN UPDATE SET ...
+--     WHEN NOT MATCHED THEN INSERT ROW
+--
+--   QUAN TRỌNG: MERGE mặc định ghi đè MỌI dòng matched, KHÔNG tự so sánh
+--   "mới hơn". Để chỉ update khi last_updated_date mới hơn, lọc NGAY TỪ
+--   NGUỒN (USING clause) bằng self-join — chỉ đưa vào MERGE những
+--   order_item_id mà last_updated_date MỚI HƠN bản đang lưu, hoặc chưa
+--   từng có trong master. Order không đổi sẽ không xuất hiện trong USING
+--   clause → MERGE không động vào → giữ nguyên 100% bản cũ.
+
+SELECT
+  s.brand,
+  s.amazon_order_id,
+  s.merchant_order_id,
+  s.order_item_id,
+  s.purchase_date,
+  s.last_updated_date,
+  s.order_date,
+  s.order_status,
+  s.item_status,
+  s.fulfillment_channel,
+  s.sales_channel,
+  s.order_channel,
+  s.ship_service_level,
+  s.product_title,
+  s.sku,
+  s.asin,
+  s.quantity,
+  s.currency_code,
+  s.item_price,
+  s.item_tax,
+  s.shipping_price,
+  s.shipping_tax,
+  s.gift_wrap_price,
+  s.item_promotion_discount,
+  s.ship_promotion_discount,
+  s.net_item_revenue,
+  s.ship_to_state,
+  s.ship_to_city,
+  s.ship_to_postal_code,
+  s.ship_to_country,
+  s.is_business_order,
+  s.is_pending_price_missing
+FROM ${ref("stg_amazon_orders")} AS s
+${ when(incremental(), `LEFT JOIN ${self()} AS m ON s.order_item_id = m.order_item_id`) }
+
+${ when(incremental(),
+  `WHERE m.order_item_id IS NULL
+     OR s.last_updated_date > m.last_updated_date`
+) }

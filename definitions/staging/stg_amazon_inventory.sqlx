@@ -1,7 +1,7 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
-  description: "Staging inventory — snapshot mới nhất per (snapshot_date, sku). Không lưu metadata.",
+  description: "Staging inventory — parse JSON từ raw + dedupe theo (snapshot_date, sku), gộp trong 1 bước. Không lưu raw_payload/metadata.",
   tags: ["staging", "daily"],
   bigquery: {
     partitionBy: "snapshot_date",
@@ -9,16 +9,66 @@ config {
   }
 }
 
-WITH ranked AS (
+WITH parsed AS (
+  SELECT
+    brand,
+    DATE(_ingested_at) AS snapshot_date,
+
+    JSON_VALUE(raw_payload, '$.sellerSku')                                        AS sku,
+    JSON_VALUE(raw_payload, '$.asin')                                             AS asin,
+    JSON_VALUE(raw_payload, '$.condition')                                        AS condition,
+    JSON_VALUE(raw_payload, '$.fnsku')                                            AS fnsku,
+    JSON_VALUE(raw_payload, '$.productName')                                      AS product_name,
+
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.totalQuantity') AS INT64)                AS total_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.fulfillableQuantity') AS INT64)
+                                                                                  AS fulfillable_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.inboundWorkingQuantity') AS INT64)
+                                                                                  AS inbound_working_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.inboundShippedQuantity') AS INT64)
+                                                                                  AS inbound_shipped_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.inboundReceivingQuantity') AS INT64)
+                                                                                  AS inbound_receiving_quantity,
+
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.reservedQuantity.totalReservedQuantity') AS INT64)
+                                                                                  AS reserved_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.reservedQuantity.pendingCustomerOrderQuantity') AS INT64)
+                                                                                  AS reserved_pending_customer_order,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.reservedQuantity.pendingTransshipmentQuantity') AS INT64)
+                                                                                  AS reserved_pending_transshipment,
+
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.totalUnfulfillableQuantity') AS INT64)
+                                                                                  AS unfulfillable_quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.customerDamagedQuantity') AS INT64)
+                                                                                  AS unfulfillable_customer_damaged,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.warehouseDamagedQuantity') AS INT64)
+                                                                                  AS unfulfillable_warehouse_damaged,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.distributorDamagedQuantity') AS INT64)
+                                                                                  AS unfulfillable_distributor_damaged,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.carrierDamagedQuantity') AS INT64)
+                                                                                  AS unfulfillable_carrier_damaged,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.defectiveQuantity') AS INT64)
+                                                                                  AS unfulfillable_defective,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.expiredQuantity') AS INT64)
+                                                                                  AS unfulfillable_expired,
+
+    _ingested_at
+
+  FROM ${ref("raw_amazon_inventory")}
+  WHERE brand = 'AFW'
+),
+
+ranked AS (
   SELECT
     *,
     ROW_NUMBER() OVER (
       PARTITION BY snapshot_date, sku
       ORDER BY _ingested_at DESC
     ) AS rn
-  FROM ${ref("flat_amazon_inventory")}
+  FROM parsed
   WHERE sku IS NOT NULL AND sku != ''
 )
+
 SELECT
   brand,
   snapshot_date,

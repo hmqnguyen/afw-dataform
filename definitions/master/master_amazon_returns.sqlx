@@ -1,0 +1,57 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master returns — giữ lại TẤT CẢ lần trả hàng đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. Khác Settlement: CÓ logic UPDATE vì return_status/resolution có thể đổi theo thời gian xử lý (ví dụ: Requested -> Received -> Refunded).",
+  tags: ["master", "daily"],
+  uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
+  bigquery: {
+    partitionBy: "return_date",
+    clusterBy: ["sku"]
+  }
+}
+
+-- CÁCH HOẠT ĐỘNG:
+--   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn
+--   bộ stg_amazon_returns.
+--
+--   Từ lần 2 trở đi (incremental): chỉ đưa vào MERGE những return_item mà
+--   _ingested_at MỚI HƠN bản đang lưu trong master, hoặc chưa từng có.
+--   Lần trả hàng không đổi (status/resolution giữ nguyên giữa các lần
+--   sync) sẽ không xuất hiện trong USING clause → giữ nguyên 100%.
+--
+-- LƯU Ý: rma_id có thể NULL (Amazon không phải lúc nào cũng trả RMA ID) —
+-- dùng COALESCE(rma_id, '') trong điều kiện so sánh để JOIN không bị bỏ
+-- qua khi cả 2 bên đều NULL (NULL = NULL luôn là UNKNOWN trong SQL, không
+-- phải TRUE).
+
+SELECT
+  s.brand,
+  s.amazon_order_id,
+  s.order_item_id,
+  s.rma_id,
+  s.sku,
+  s.asin,
+  s.quantity,
+  s.return_date_raw,
+  s.return_timestamp,
+  s.return_date,
+  s.return_reason,
+  s.return_status,
+  s.resolution,
+  s.fulfillment_center_id,
+  s.label_type,
+  s.label_cost,
+  s._ingested_at
+FROM ${ref("stg_amazon_returns")} AS s
+${ when(incremental(),
+  `LEFT JOIN ${self()} AS m
+    ON  s.amazon_order_id = m.amazon_order_id
+    AND s.sku = m.sku
+    AND s.return_date_raw = m.return_date_raw
+    AND COALESCE(s.rma_id, '') = COALESCE(m.rma_id, '')`
+) }
+
+${ when(incremental(),
+  `WHERE m.amazon_order_id IS NULL
+     OR s._ingested_at > m._ingested_at`
+) }

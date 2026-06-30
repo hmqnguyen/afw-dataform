@@ -5,8 +5,8 @@
   "defaultAssertionDataset": "afw_amazon_fact",
   "vars": {
     "raw_dataset":     "afw_amazon_raw",
-    "flat_dataset":    "afw_amazon_flat",
     "staging_dataset": "afw_amazon_staging",
-    "fact_dataset":    "afw_amazon_fact"
+    "fact_dataset":    "afw_amazon_fact",
+    "master_dataset":  "afw_amazon_fact"
   }
 }

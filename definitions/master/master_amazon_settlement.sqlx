@@ -1,0 +1,71 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master settlement — giữ lại TẤT CẢ giao dịch settlement đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. INSERT-ONLY: giao dịch settlement coi là KHÔNG ĐỔI sau khi Amazon đã ghi nhận, nên không có logic UPDATE — chỉ thêm giao dịch mới, bỏ qua giao dịch đã có.",
+  tags: ["master", "daily"],
+  uniqueKey: [
+    "settlement_id", "amazon_order_id", "sku",
+    "amount_type", "amount_description", "posted_date_time"
+  ],
+  bigquery: {
+    partitionBy: "posted_date",
+    clusterBy: ["sku", "amount_type"]
+  }
+}
+
+-- CÁCH HOẠT ĐỘNG:
+--   Lần đầu chạy (chưa có bảng, full refresh): CREATE TABLE AS SELECT toàn
+--   bộ stg_amazon_settlement.
+--
+--   Từ lần 2 trở đi (incremental): chỉ đưa vào MERGE những giao dịch CHƯA
+--   từng có trong master (theo composite key). Giao dịch đã có → KHÔNG xuất
+--   hiện trong USING clause → MERGE không động vào → giữ nguyên 100%.
+--
+--   KHÁC master_amazon_orders: KHÔNG có điều kiện "mới hơn" vì settlement
+--   không có cột nghiệp vụ nào biểu thị "Amazon đã sửa lại giao dịch này"
+--   — coi giao dịch settlement là bất biến sau khi ghi nhận.
+--
+-- LƯU Ý uniqueKey: amount (số tiền) KHÔNG nằm trong uniqueKey vì BigQuery
+-- MERGE ON clause khó xử lý NUMERIC so sánh trực tiếp ổn định — composite
+-- key 6 cột (bỏ amount) vẫn đủ phân biệt 99% trường hợp; nếu có 2 dòng
+-- trùng cả 6 cột nhưng khác amount (hiếm), dòng INSERT đầu tiên sẽ là dòng
+-- duy nhất được giữ — lỗi này nên được resolve ở nguồn (raw) nếu gặp.
+
+SELECT
+  s.brand,
+  s.settlement_id,
+  s.amazon_order_id,
+  s.merchant_order_id,
+  s.adjustment_id,
+  s.shipment_id,
+  s.order_item_code,
+  s.merchant_order_item_id,
+  s.merchant_adjustment_item_id,
+  s.sku,
+  s.quantity_purchased,
+  s.promotion_id,
+  s.marketplace_name,
+  s.fulfillment_id,
+  s.transaction_type,
+  s.amount_type,
+  s.amount_description,
+  s.currency_code,
+  s.amount,
+  s.total_amount,
+  s.settlement_start_date,
+  s.settlement_end_date,
+  s.posted_date,
+  s.posted_date_time,
+  s.deposit_date
+FROM ${ref("stg_amazon_settlement")} AS s
+${ when(incremental(),
+  `LEFT JOIN ${self()} AS m
+    ON  s.settlement_id = m.settlement_id
+    AND s.amazon_order_id = m.amazon_order_id
+    AND s.sku = m.sku
+    AND s.amount_type = m.amount_type
+    AND s.amount_description = m.amount_description
+    AND s.posted_date_time = m.posted_date_time`
+) }
+
+${ when(incremental(), `WHERE m.settlement_id IS NULL`) }

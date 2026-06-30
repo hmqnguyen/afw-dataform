@@ -3,12 +3,16 @@ defaultDataset: afw_amazon_fact_dev
 defaultLocation: US
 defaultAssertionDataset: afw_amazon_fact_dev
 
+# Kiến trúc 3 lớp (đã gộp flat vào staging — parse JSON + dedupe trong
+# cùng 1 file SQLX):
+#   Raw -> Staging -> Master & Fact
+#
 # Location phải khớp với BigQuery dataset location.
 # Dataset đang ở US multi-region → dùng US ở đây.
 # Dataform repository region (us-central1) KHÔNG cần khớp với defaultLocation.
 
 vars:
   raw_dataset: afw_amazon_raw_dev
-  flat_dataset: afw_amazon_flat_dev
   staging_dataset: afw_amazon_staging_dev
   fact_dataset: afw_amazon_fact_dev
+  master_dataset: afw_amazon_fact_dev

@@ -2,6 +2,10 @@
 // Khai báo toàn bộ raw tables như external data sources.
 // Raw tables do C# sync services ghi vào — Dataform chỉ đọc, không quản lý.
 //
+// LƯU Ý: raw_amazon_ads_performance KHÔNG còn ở đây — Ads đã tách hoàn
+// toàn sang project riêng (AfwAdsSync C# + AfwAdsDataform), xem
+// definitions/sources/sources.js của repo đó.
+//
 // Dùng dataform.projectConfig.vars.raw_dataset để lấy tên dataset
 // tương ứng với môi trường (dev/prod) từ environments/*.json.
 // Nếu vars chưa set, fallback về "afw_amazon_raw".
@@ -14,7 +18,6 @@ const rawTables = [
   "raw_amazon_order_report",
   "raw_amazon_inventory",
   "raw_amazon_settlement",
-  "raw_amazon_ads_performance",
   "raw_amazon_returns",
   "raw_amazon_fba_returns",
   "raw_amazon_asin_review_topics",

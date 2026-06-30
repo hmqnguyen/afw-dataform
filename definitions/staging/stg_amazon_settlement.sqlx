@@ -1,7 +1,7 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
-  description: "Staging settlement — dedupe 7 cột composite key. Không lưu metadata.",
+  description: "Staging settlement — parse JSON V2 + xử lý local currency + dedupe 7 cột composite key, gộp trong 1 bước. Không lưu raw_payload/metadata.",
   tags: ["staging", "daily"],
   bigquery: {
     partitionBy: "posted_date",
@@ -9,7 +9,73 @@ config {
   }
 }
 
-WITH ranked AS (
+WITH parsed AS (
+  SELECT
+    brand,
+
+    -- Định danh
+    JSON_VALUE(raw_payload, '$."settlement-id"')              AS settlement_id,
+    JSON_VALUE(raw_payload, '$."order-id"')                   AS amazon_order_id,
+    JSON_VALUE(raw_payload, '$."merchant-order-id"')          AS merchant_order_id,
+    JSON_VALUE(raw_payload, '$."adjustment-id"')              AS adjustment_id,
+    JSON_VALUE(raw_payload, '$."shipment-id"')                AS shipment_id,
+    JSON_VALUE(raw_payload, '$."order-item-code"')            AS order_item_code,
+    JSON_VALUE(raw_payload, '$."merchant-order-item-id"')     AS merchant_order_item_id,
+    JSON_VALUE(raw_payload, '$."merchant-adjustment-item-id"') AS merchant_adjustment_item_id,
+
+    -- Sản phẩm
+    JSON_VALUE(raw_payload, '$.sku')                          AS sku,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."quantity-purchased"') AS INT64) AS quantity_purchased,
+    JSON_VALUE(raw_payload, '$."promotion-id"')               AS promotion_id,
+    JSON_VALUE(raw_payload, '$."marketplace-name"')           AS marketplace_name,
+    JSON_VALUE(raw_payload, '$."fulfillment-id"')             AS fulfillment_id,
+
+    -- Loại giao dịch
+    JSON_VALUE(raw_payload, '$."transaction-type"')           AS transaction_type,
+    JSON_VALUE(raw_payload, '$."amount-type"')                AS amount_type,
+    JSON_VALUE(raw_payload, '$."amount-description"')         AS amount_description,
+
+    -- Số tiền (xử lý local currency format)
+    JSON_VALUE(raw_payload, '$.currency')                     AS currency_code,
+
+    SAFE_CAST(
+      CASE
+        WHEN JSON_VALUE(raw_payload, '$.currency') != 'USD'
+          AND REGEXP_CONTAINS(JSON_VALUE(raw_payload, '$.amount'), r',\d{2}$')
+          THEN REPLACE(REPLACE(JSON_VALUE(raw_payload, '$.amount'), '.', ''), ',', '.')
+        ELSE REPLACE(JSON_VALUE(raw_payload, '$.amount'), ',', '')
+      END AS NUMERIC
+    ) AS amount,
+
+    SAFE_CAST(
+      CASE
+        WHEN JSON_VALUE(raw_payload, '$.currency') != 'USD'
+          AND REGEXP_CONTAINS(JSON_VALUE(raw_payload, '$."total-amount"'), r',\d{2}$')
+          THEN REPLACE(REPLACE(JSON_VALUE(raw_payload, '$."total-amount"'), '.', ''), ',', '.')
+        ELSE REPLACE(JSON_VALUE(raw_payload, '$."total-amount"'), ',', '')
+      END AS NUMERIC
+    ) AS total_amount,
+
+    -- Thời gian
+    PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10))
+                                                              AS settlement_start_date,
+    PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10))
+                                                              AS settlement_end_date,
+    DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP))
+                                                              AS posted_date,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP)
+                                                              AS posted_date_time,
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."deposit-date"'), 1, 10))
+                                                              AS deposit_date,
+
+    _ingested_at
+
+  FROM ${ref("raw_amazon_settlement")}
+  WHERE brand = 'AFW'
+),
+
+ranked AS (
   SELECT
     *,
     ROW_NUMBER() OVER (
@@ -23,9 +89,10 @@ WITH ranked AS (
         posted_date_time
       ORDER BY _ingested_at DESC
     ) AS rn
-  FROM ${ref("flat_amazon_settlement")}
+  FROM parsed
   WHERE sku IS NOT NULL AND sku != ''
 )
+
 SELECT
   brand,
   settlement_id,

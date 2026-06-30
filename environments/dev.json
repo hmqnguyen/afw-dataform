@@ -1,12 +1,12 @@
 {
   "defaultProject": "allforwood-dev",
   "defaultDataset": "afw_amazon_fact_dev",
-  "defaultLocation": "us-central1",
+  "defaultLocation": "US",
   "defaultAssertionDataset": "afw_amazon_fact_dev",
   "vars": {
     "raw_dataset":     "afw_amazon_raw_dev",
-    "flat_dataset":    "afw_amazon_flat_dev",
     "staging_dataset": "afw_amazon_staging_dev",
-    "fact_dataset":    "afw_amazon_fact_dev"
+    "fact_dataset":    "afw_amazon_fact_dev",
+    "master_dataset":  "afw_amazon_fact_dev"
   }
 }
