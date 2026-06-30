@@ -36,11 +36,15 @@ WITH parsed AS (
     JSON_VALUE(raw_payload, '$."amount-description"')         AS amount_description,
 
     -- Số tiền (xử lý local currency format)
+    -- LƯU Ý: currency có thể là "" (rỗng) trong thực tế — ví dụ dòng phí
+    -- nội bộ Amazon (amount-type="Cost of Advertising") không gắn
+    -- marketplace cụ thể. Coi currency rỗng/NULL là USD (an toàn, không
+    -- chạy nhánh xử lý local currency phức tạp không cần thiết).
     JSON_VALUE(raw_payload, '$.currency')                     AS currency_code,
 
     SAFE_CAST(
       CASE
-        WHEN JSON_VALUE(raw_payload, '$.currency') != 'USD'
+        WHEN COALESCE(JSON_VALUE(raw_payload, '$.currency'), '') NOT IN ('', 'USD')
           AND REGEXP_CONTAINS(JSON_VALUE(raw_payload, '$.amount'), r',\d{2}$')
           THEN REPLACE(REPLACE(JSON_VALUE(raw_payload, '$.amount'), '.', ''), ',', '.')
         ELSE REPLACE(JSON_VALUE(raw_payload, '$.amount'), ',', '')
@@ -49,7 +53,7 @@ WITH parsed AS (
 
     SAFE_CAST(
       CASE
-        WHEN JSON_VALUE(raw_payload, '$.currency') != 'USD'
+        WHEN COALESCE(JSON_VALUE(raw_payload, '$.currency'), '') NOT IN ('', 'USD')
           AND REGEXP_CONTAINS(JSON_VALUE(raw_payload, '$."total-amount"'), r',\d{2}$')
           THEN REPLACE(REPLACE(JSON_VALUE(raw_payload, '$."total-amount"'), '.', ''), ',', '.')
         ELSE REPLACE(JSON_VALUE(raw_payload, '$."total-amount"'), ',', '')
@@ -57,9 +61,16 @@ WITH parsed AS (
     ) AS total_amount,
 
     -- Thời gian
-    PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10))
+    -- SAFE.PARSE_DATE — bắt buộc dùng SAFE vì raw_payload thực tế có thể
+    -- chứa chuỗi rỗng "" cho các field ngày này (ví dụ dòng amount-type=
+    -- "Cost of Advertising" có settlement-start-date/settlement-end-date
+    -- đều rỗng). PARSE_DATE thường (không SAFE) sẽ FAIL CỨNG toàn bộ query
+    -- với "Failed to parse input string \"\"" — đã xác nhận qua lỗi thật.
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10))
                                                               AS settlement_start_date,
-    PARSE_DATE('%Y-%m-%d', SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10))
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10))
                                                               AS settlement_end_date,
     DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP))
                                                               AS posted_date,
