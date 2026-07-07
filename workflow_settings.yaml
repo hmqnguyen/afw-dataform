@@ -1,18 +1,19 @@
 defaultProject: allforwood-dev
-defaultDataset: afw_amazon_fact_dev
+defaultDataset: afw_amazon_fact
 defaultLocation: US
-defaultAssertionDataset: afw_amazon_fact_dev
+defaultAssertionDataset: afw_amazon_fact
 
-# Kiến trúc 3 lớp (đã gộp flat vào staging — parse JSON + dedupe trong
-# cùng 1 file SQLX):
-#   Raw -> Staging -> Master & Fact
-#
-# Location phải khớp với BigQuery dataset location.
-# Dataset đang ở US multi-region → dùng US ở đây.
-# Dataform repository region (us-central1) KHÔNG cần khớp với defaultLocation.
+# Kiến trúc 4 lớp + mart: Raw (C# AfwAmazonSync ghi) → Staging → Master & Fact → Mart
+#   - C# chỉ ĐỌC/GHI raw + state; Dataform sở hữu staging → master → fact → mart.
+#   - 5 dataset TÁCH RIÊNG (raw/staging/master/fact/mart) — master KHÔNG còn gộp vào fact.
+#   - Tách dev/prod theo GCP project (allforwood-dev vs allforwood),
+#     KHÔNG dùng _dev suffix — cùng tên dataset, khác project.
+#   - Location phải khớp BigQuery dataset location (US multi-region).
+#     Dataform repo region (us-central1) KHÔNG cần khớp defaultLocation.
 
 vars:
-  raw_dataset: afw_amazon_raw_dev
-  staging_dataset: afw_amazon_staging_dev
-  fact_dataset: afw_amazon_fact_dev
-  master_dataset: afw_amazon_fact_dev
+  raw_dataset:     afw_amazon_raw
+  staging_dataset: afw_amazon_staging
+  fact_dataset:    afw_amazon_fact
+  master_dataset:  afw_amazon_master
+  mart_dataset:    afw_amazon_mart

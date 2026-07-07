@@ -2,7 +2,7 @@ config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
   description: "Staging orders — parse JSON từ raw + dedupe theo order_item_id, gộp trong 1 bước. Không lưu raw_payload/metadata.",
-  tags: ["staging", "daily"],
+  tags: ["staging", "amazon", "orders"],
   bigquery: {
     partitionBy: "order_date",
     clusterBy: ["sku"]
@@ -16,6 +16,7 @@ WITH parsed AS (
     -- Định danh
     JSON_VALUE(raw_payload, '$."amazon-order-id"')          AS amazon_order_id,
     JSON_VALUE(raw_payload, '$."merchant-order-id"')        AS merchant_order_id,
+    JSON_VALUE(raw_payload, '$."purchase-order-number"')    AS purchase_order_number,  -- PO khách (đơn B2B)
     JSON_VALUE(raw_payload, '$."order-item-id"')            AS order_item_id,
 
     -- Thời gian (SAFE_CAST AS TIMESTAMP — tự nhận diện mọi format ISO 8601,
@@ -50,8 +51,10 @@ WITH parsed AS (
     SAFE_CAST(JSON_VALUE(raw_payload, '$."shipping-price"') AS NUMERIC)          AS shipping_price,
     SAFE_CAST(JSON_VALUE(raw_payload, '$."shipping-tax"') AS NUMERIC)            AS shipping_tax,
     SAFE_CAST(JSON_VALUE(raw_payload, '$."gift-wrap-price"') AS NUMERIC)         AS gift_wrap_price,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."gift-wrap-tax"') AS NUMERIC)           AS gift_wrap_tax,
     SAFE_CAST(JSON_VALUE(raw_payload, '$."item-promotion-discount"') AS NUMERIC) AS item_promotion_discount,
     SAFE_CAST(JSON_VALUE(raw_payload, '$."ship-promotion-discount"') AS NUMERIC) AS ship_promotion_discount,
+    JSON_VALUE(raw_payload, '$."promotion-ids"')            AS promotion_ids,     -- mã KM áp dụng (attribution)
 
     -- Tính toán
     SAFE_CAST(JSON_VALUE(raw_payload, '$."item-price"') AS NUMERIC)
@@ -74,7 +77,9 @@ WITH parsed AS (
 
   FROM ${ref("raw_amazon_order_report")}
   WHERE brand = 'AFW'
-    AND JSON_VALUE(raw_payload, '$."order-status"') != 'Canceled'
+    -- Amazon all-orders flat file spell 'Cancelled' (2 L); vài report/locale
+    -- khác lại 'Canceled' (1 L) → lọc CẢ HAI để không lọt đơn huỷ.
+    AND JSON_VALUE(raw_payload, '$."order-status"') NOT IN ('Cancelled', 'Canceled')
 ),
 
 ranked AS (
@@ -93,6 +98,7 @@ SELECT
   brand,
   amazon_order_id,
   merchant_order_id,
+  purchase_order_number,
   order_item_id,
   purchase_date,
   last_updated_date,
@@ -113,8 +119,10 @@ SELECT
   shipping_price,
   shipping_tax,
   gift_wrap_price,
+  gift_wrap_tax,
   item_promotion_discount,
   ship_promotion_discount,
+  promotion_ids,
   net_item_revenue,
   ship_to_state,
   ship_to_city,

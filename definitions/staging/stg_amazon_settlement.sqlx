@@ -2,7 +2,7 @@ config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
   description: "Staging settlement — parse JSON V2 + xử lý local currency + dedupe 7 cột composite key, gộp trong 1 bước. Không lưu raw_payload/metadata.",
-  tags: ["staging", "daily"],
+  tags: ["staging", "amazon", "settlement"],
   bigquery: {
     partitionBy: "posted_date",
     clusterBy: ["sku", "amount_type"]
@@ -86,6 +86,23 @@ WITH parsed AS (
   WHERE brand = 'AFW'
 ),
 
+-- Các field cấp-settlement (start/end/deposit/total/currency) CHỈ xuất hiện
+-- trên DÒNG HEADER (transaction-type rỗng, không có sku) — dòng chi tiết để
+-- TRỐNG. Header lại bị lọc ở bước sau (sku IS NULL) → nếu không broadcast,
+-- 5 cột này NULL 100%. Dùng window theo settlement_id để "kéo" giá trị header
+-- xuống mọi dòng của cùng settlement (cần cho đối soát payout/deposit).
+enriched AS (
+  SELECT
+    * EXCEPT(settlement_start_date, settlement_end_date, deposit_date, total_amount, currency_code),
+    MAX(settlement_start_date) OVER w                       AS settlement_start_date,
+    MAX(settlement_end_date)   OVER w                       AS settlement_end_date,
+    MAX(deposit_date)          OVER w                       AS deposit_date,
+    MAX(total_amount)          OVER w                       AS total_amount,
+    COALESCE(NULLIF(MAX(currency_code) OVER w, ''), 'USD')  AS currency_code
+  FROM parsed
+  WINDOW w AS (PARTITION BY settlement_id)
+),
+
 ranked AS (
   SELECT
     *,
@@ -100,7 +117,7 @@ ranked AS (
         posted_date_time
       ORDER BY _ingested_at DESC
     ) AS rn
-  FROM parsed
+  FROM enriched
   WHERE sku IS NOT NULL AND sku != ''
 )
 

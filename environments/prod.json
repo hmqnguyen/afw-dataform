@@ -7,6 +7,7 @@
     "raw_dataset":     "afw_amazon_raw",
     "staging_dataset": "afw_amazon_staging",
     "fact_dataset":    "afw_amazon_fact",
-    "master_dataset":  "afw_amazon_fact"
+    "master_dataset":  "afw_amazon_master",
+    "mart_dataset":    "afw_amazon_mart"
   }
 }

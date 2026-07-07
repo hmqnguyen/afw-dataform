@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   description: "Master settlement — giữ lại TẤT CẢ giao dịch settlement đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. INSERT-ONLY: giao dịch settlement coi là KHÔNG ĐỔI sau khi Amazon đã ghi nhận, nên không có logic UPDATE — chỉ thêm giao dịch mới, bỏ qua giao dịch đã có.",
-  tags: ["master", "daily"],
+  tags: ["master", "amazon", "settlement"],
   uniqueKey: [
     "settlement_id", "amazon_order_id", "sku",
     "amount_type", "amount_description", "posted_date_time"

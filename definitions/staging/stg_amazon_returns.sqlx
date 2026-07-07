@@ -1,39 +1,51 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
-  description: "Staging returns — parse JSON + dedupe theo (order_id, sku, return_date_raw, rma_id), gộp trong 1 bước. Tên cột chưa verify với data thật. Không lưu raw_payload/metadata.",
-  tags: ["staging", "daily"],
+  description: "Staging returns (FBM/MFN) — parse GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE. Field name là Title-Case-có-dấu-cách ('Order ID','Merchant SKU'...), ngày dạng DD-Mon-YYYY. Dedupe theo (order, sku, return_date_raw, rma_id).",
+  tags: ["staging", "amazon", "returns"],
   bigquery: {
     partitionBy: "return_date",
     clusterBy: ["sku"]
   }
 }
 
+-- LƯU Ý (đã verify bằng data thật): report này KHÁC hẳn quy ước lowercase-
+-- hyphen của Orders/Settlement — header là "Order ID", "Merchant SKU",
+-- "Return request date"... JSON key phải khớp CHÍNH XÁC (JSON_VALUE
+-- case-sensitive). Ngày là "18-May-2026" → PARSE_DATE('%d-%b-%Y'), KHÔNG
+-- dùng SAFE_CAST AS TIMESTAMP (sẽ ra NULL).
 WITH parsed AS (
   SELECT
     brand,
 
-    JSON_VALUE(raw_payload, '$."order-id"')                  AS amazon_order_id,
-    JSON_VALUE(raw_payload, '$."order-item-id"')             AS order_item_id,
-    JSON_VALUE(raw_payload, '$."rma-id"')                    AS rma_id,
+    JSON_VALUE(raw_payload, '$."Order ID"')                  AS amazon_order_id,
+    JSON_VALUE(raw_payload, '$."Order Item ID"')             AS order_item_id,
+    -- Ưu tiên Amazon RMA ID; Merchant RMA ID thường rỗng
+    COALESCE(
+      NULLIF(JSON_VALUE(raw_payload, '$."Amazon RMA ID"'), ''),
+      NULLIF(JSON_VALUE(raw_payload, '$."Merchant RMA ID"'), '')
+    )                                                         AS rma_id,
 
-    JSON_VALUE(raw_payload, '$.sku')                         AS sku,
-    JSON_VALUE(raw_payload, '$.asin')                        AS asin,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$.quantity') AS INT64) AS quantity,
+    JSON_VALUE(raw_payload, '$."Merchant SKU"')              AS sku,
+    JSON_VALUE(raw_payload, '$."ASIN"')                      AS asin,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Return quantity"') AS INT64) AS quantity,
 
-    JSON_VALUE(raw_payload, '$."return-date"')               AS return_date_raw,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP)
-                                                              AS return_timestamp,
-    DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP))
-                                                              AS return_date,
+    JSON_VALUE(raw_payload, '$."Return request date"')       AS return_date_raw,
+    TIMESTAMP(SAFE.PARSE_DATE('%d-%b-%Y',
+      JSON_VALUE(raw_payload, '$."Return request date"')))    AS return_timestamp,
+    SAFE.PARSE_DATE('%d-%b-%Y',
+      JSON_VALUE(raw_payload, '$."Return request date"'))     AS return_date,
 
-    JSON_VALUE(raw_payload, '$."return-reason"')             AS return_reason,
-    JSON_VALUE(raw_payload, '$.status')                      AS return_status,
-    JSON_VALUE(raw_payload, '$.resolution')                  AS resolution,
+    JSON_VALUE(raw_payload, '$."Return Reason"')             AS return_reason,
+    JSON_VALUE(raw_payload, '$."Return request status"')     AS return_status,   -- Approved/Declined...
+    JSON_VALUE(raw_payload, '$."Resolution"')                AS resolution,      -- StandardRefund/AutomatedRefund/RefundAtFirstScan
+    JSON_VALUE(raw_payload, '$."Return type"')               AS return_type,     -- C-Returns
 
-    JSON_VALUE(raw_payload, '$."fulfillment-center-id"')     AS fulfillment_center_id,
-    JSON_VALUE(raw_payload, '$."label-type"')                AS label_type,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."label-cost"') AS NUMERIC) AS label_cost,
+    -- FBM report KHÔNG có fulfillment-center-id (đó là field của FBA report)
+    CAST(NULL AS STRING)                                     AS fulfillment_center_id,
+    JSON_VALUE(raw_payload, '$."Label type"')                AS label_type,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Label cost"') AS NUMERIC)      AS label_cost,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Refunded Amount"') AS NUMERIC) AS refunded_amount,  -- refund $ thực tế
 
     _ingested_at
 
@@ -66,13 +78,13 @@ SELECT
   return_reason,
   return_status,
   resolution,
+  return_type,
   fulfillment_center_id,
   label_type,
   label_cost,
-  -- Giữ lại _ingested_at (khác các bảng staging khác) — dùng để
-  -- master_amazon_returns so sánh "mới hơn", vì return_status/resolution
-  -- có thể đổi theo thời gian xử lý (khác Settlement, vốn ghi 1 lần
-  -- không đổi).
+  refunded_amount,
+  -- Giữ _ingested_at để master_amazon_returns so sánh "mới hơn"
+  -- (return_status/resolution có thể đổi theo thời gian xử lý).
   _ingested_at
 FROM ranked
 WHERE rn = 1

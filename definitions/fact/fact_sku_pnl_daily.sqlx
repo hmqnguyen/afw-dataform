@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.fact_dataset,
   description: "Fact P&L by SKU daily — MERGE từ 3 nguồn (Orders, Settlement, Returns). Grain: brand × channel × sku × day. Ads TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily) — xem README để biết cách JOIN cross-project nếu cần P&L có Ads. Chưa có COGS và Cost Allocation Engine.",
-  tags: ["fact", "daily"],
+  tags: ["fact", "amazon", "sku_pnl"],
   uniqueKey: ["brand", "channel", "sku", "day"],
   bigquery: {
     partitionBy: "day",
@@ -30,7 +30,7 @@ WITH revenue_agg AS (
     SUM(quantity)                                                        AS units_sold,
     SUM(COALESCE(net_item_revenue, 0))                                   AS gross_revenue,
     SUM(COALESCE(shipping_price, 0))                                     AS shipping_revenue,
-    SUM(COALESCE(item_tax, 0) + COALESCE(shipping_tax, 0))               AS tax_collected,
+    SUM(COALESCE(item_tax, 0) + COALESCE(shipping_tax, 0) + COALESCE(gift_wrap_tax, 0)) AS tax_collected,
     SUM(COALESCE(item_promotion_discount, 0)
       + COALESCE(ship_promotion_discount, 0))                            AS promotion_discount,
     COUNTIF(fulfillment_channel = 'Amazon')                              AS fba_item_count,
@@ -52,8 +52,13 @@ fees_agg AS (
     SUM(IF(amount_description LIKE '%Storage%', amount, 0))              AS storage_fee,
     SUM(IF(amount_description LIKE '%Refund%'
       OR transaction_type = 'Refund', amount, 0))                       AS refund_amount,
+    -- other_fees: CHỈ các dòng phí thật (amount_type='ItemFees') chưa được
+    -- gom ở trên. TRÁNH gộp Principal/Tax/WithheldTax/Promotion (ItemPrice/
+    -- ItemWithheldTax/Promotion) — đó là doanh thu/thuế pass-through, KHÔNG
+    -- phải phí. Trước đây catch-all khiến other_fees ≈ Principal (sai nghĩa).
     SUM(IF(
-      amount_description NOT IN ('Commission')
+      amount_type = 'ItemFees'
+      AND amount_description NOT IN ('Commission')
       AND amount_description NOT LIKE 'FBA%Fulfillment%'
       AND amount_description NOT LIKE '%Storage%'
       AND amount_description NOT LIKE '%Refund%'
@@ -70,11 +75,22 @@ returns_agg AS (
     brand,
     'Amazon'    AS channel,
     sku,
-    return_date AS day,
-    SUM(COALESCE(quantity, 0)) AS units_returned
-  FROM ${ref("stg_amazon_returns")}
-  WHERE return_date >= target_date_start
-  GROUP BY brand, sku, return_date
+    day,
+    SUM(units_returned) AS units_returned
+  FROM (
+    -- FBM/MFN returns (có refund $, RMA) — stg_amazon_returns
+    SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
+    FROM ${ref("stg_amazon_returns")}
+    WHERE return_date >= target_date_start
+    UNION ALL
+    -- FBA returns (đơn vị vật lý nhận về kho) — stg_amazon_fba_returns.
+    -- Population TÁCH BIỆT với FBM (đơn FBA không có trong report FBM) →
+    -- union không double-count.
+    SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
+    FROM ${ref("stg_amazon_fba_returns")}
+    WHERE return_date >= target_date_start
+  )
+  GROUP BY brand, sku, day
 ),
 
 combined AS (
@@ -125,8 +141,13 @@ SELECT
   COALESCE(other_fees, 0)                AS other_fees,
   COALESCE(total_settlement_amount, 0)   AS total_settlement_amount,
   COALESCE(units_returned, 0)            AS units_returned,
-  -- channel_contribution_margin_pre_cogs: CHƯA trừ COGS (Nhà Máy 5) và
-  -- CHƯA trừ ad_spend (Ads đã tách project riêng — xem AfwAdsDataform)
+  -- channel_contribution_margin_pre_cogs: CHƯA trừ COGS (Nhà Máy 5),
+  -- CHƯA trừ ad_spend (Ads tách sang AfwAdsDataform), và CỐ Ý KHÔNG trừ
+  -- refund — margin ở đây là PRE-REFUND (quyết định nghiệp vụ; hoàn hàng
+  -- xử lý ở bước P&L sau). Lưu ý caveat: dòng commission được hoàn lại
+  -- (transaction_type='Refund', amount dương) vẫn rơi vào commission_fee
+  -- của NGÀY refund → margin ngày đó có phần dương nhỏ. Chấp nhận theo
+  -- góc nhìn dòng tiền theo ngày; tách nếu sau này cần margin theo đơn.
   (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
     - COALESCE(commission_fee, 0) * -1
     - COALESCE(fba_fulfillment_fee, 0) * -1

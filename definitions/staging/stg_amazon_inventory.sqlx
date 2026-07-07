@@ -2,7 +2,7 @@ config {
   type: "table",
   schema: dataform.projectConfig.vars.staging_dataset,
   description: "Staging inventory — parse JSON từ raw + dedupe theo (snapshot_date, sku), gộp trong 1 bước. Không lưu raw_payload/metadata.",
-  tags: ["staging", "daily"],
+  tags: ["staging", "amazon", "inventory"],
   bigquery: {
     partitionBy: "snapshot_date",
     clusterBy: ["sku"]
@@ -17,8 +17,11 @@ WITH parsed AS (
     JSON_VALUE(raw_payload, '$.sellerSku')                                        AS sku,
     JSON_VALUE(raw_payload, '$.asin')                                             AS asin,
     JSON_VALUE(raw_payload, '$.condition')                                        AS condition,
-    JSON_VALUE(raw_payload, '$.fnsku')                                            AS fnsku,
+    JSON_VALUE(raw_payload, '$.fnSku')                                            AS fnsku,
     JSON_VALUE(raw_payload, '$.productName')                                      AS product_name,
+    -- lastUpdatedTime: thời điểm Amazon cập nhật tồn của SKU (rỗng nếu tồn=0)
+    -- → tín hiệu độ mới/đọng của dữ liệu tồn kho.
+    SAFE_CAST(NULLIF(JSON_VALUE(raw_payload, '$.lastUpdatedTime'), '') AS TIMESTAMP) AS last_updated_time,
 
     SAFE_CAST(JSON_VALUE(raw_payload, '$.totalQuantity') AS INT64)                AS total_quantity,
     SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.fulfillableQuantity') AS INT64)
@@ -76,6 +79,7 @@ SELECT
   asin,
   fnsku,
   product_name,
+  last_updated_time,
   condition,
   total_quantity,
   fulfillable_quantity,

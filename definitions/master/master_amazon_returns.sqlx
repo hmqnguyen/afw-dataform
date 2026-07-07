@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   description: "Master returns — giữ lại TẤT CẢ lần trả hàng đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. Khác Settlement: CÓ logic UPDATE vì return_status/resolution có thể đổi theo thời gian xử lý (ví dụ: Requested -> Received -> Refunded).",
-  tags: ["master", "daily"],
+  tags: ["master", "amazon", "returns"],
   uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
   bigquery: {
     partitionBy: "return_date",
@@ -70,9 +70,11 @@ SELECT
   s.return_reason,
   s.return_status,
   s.resolution,
+  s.return_type,
   s.fulfillment_center_id,
   s.label_type,
   s.label_cost,
+  s.refunded_amount,
   s._ingested_at
 FROM ${ref("stg_amazon_returns")} AS s
 ${ when(incremental(),

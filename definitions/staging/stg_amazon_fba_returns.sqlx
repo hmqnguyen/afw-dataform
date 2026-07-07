@@ -1,0 +1,80 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging FBA returns — parse GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA. Header lowercase-hyphen, return-date ISO 8601. Grain: 1 dòng = 1 đơn vị vật lý nhận về kho (license-plate-number). KHÔNG có refund $. Dedupe theo license_plate_number.",
+  tags: ["staging", "amazon", "fba_returns"],
+  bigquery: {
+    partitionBy: "return_date",
+    clusterBy: ["sku"]
+  }
+}
+
+-- Report FBA KHÁC report FBM: header lowercase-hyphen (giống Orders),
+-- return-date là ISO 8601 (+00:00) → SAFE_CAST AS TIMESTAMP OK. Không có
+-- rma_id/refund; thay bằng detailed_disposition + license_plate_number
+-- (định danh đơn vị vật lý). Population FBA TÁCH BIỆT với FBM (đơn FBA
+-- không nằm trong report FBM) nên union ở fact không double-count.
+WITH parsed AS (
+  SELECT
+    brand,
+
+    JSON_VALUE(raw_payload, '$."order-id"')                  AS amazon_order_id,
+    JSON_VALUE(raw_payload, '$.sku')                         AS sku,
+    JSON_VALUE(raw_payload, '$.asin')                        AS asin,
+    JSON_VALUE(raw_payload, '$.fnsku')                       AS fnsku,
+    JSON_VALUE(raw_payload, '$."product-name"')              AS product_name,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.quantity') AS INT64) AS quantity,
+
+    JSON_VALUE(raw_payload, '$."return-date"')               AS return_date_raw,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP)
+                                                              AS return_timestamp,
+    DATE(SAFE_CAST(JSON_VALUE(raw_payload, '$."return-date"') AS TIMESTAMP))
+                                                              AS return_date,
+
+    JSON_VALUE(raw_payload, '$."fulfillment-center-id"')     AS fulfillment_center_id,
+    JSON_VALUE(raw_payload, '$."detailed-disposition"')      AS detailed_disposition,  -- CUSTOMER_DAMAGED...
+    JSON_VALUE(raw_payload, '$.reason')                      AS return_reason,         -- UNWANTED_ITEM/DEFECTIVE
+    JSON_VALUE(raw_payload, '$.status')                      AS status,                -- không ổn định (có thể vắng)
+    JSON_VALUE(raw_payload, '$."license-plate-number"')      AS license_plate_number,  -- ID đơn vị vật lý
+    JSON_VALUE(raw_payload, '$."customer-comments"')         AS customer_comments,
+
+    _ingested_at
+
+  FROM ${ref("raw_amazon_fba_returns")}
+  WHERE brand = 'AFW'
+),
+
+ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY COALESCE(
+        NULLIF(license_plate_number, ''),
+        CONCAT(amazon_order_id, '|', sku, '|', return_date_raw)
+      )
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM parsed
+  WHERE sku IS NOT NULL AND sku != ''
+)
+
+SELECT
+  brand,
+  amazon_order_id,
+  sku,
+  asin,
+  fnsku,
+  product_name,
+  quantity,
+  return_date_raw,
+  return_timestamp,
+  return_date,
+  fulfillment_center_id,
+  detailed_disposition,
+  return_reason,
+  status,
+  license_plate_number,
+  customer_comments,
+  _ingested_at
+FROM ranked
+WHERE rn = 1
