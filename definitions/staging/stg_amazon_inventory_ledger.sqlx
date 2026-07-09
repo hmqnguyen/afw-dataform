@@ -1,0 +1,57 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging Inventory Ledger Summary (DAILY, per FNSKU/MSKU/Disposition) — số lượng tồn theo ngày chuẩn audit. VERIFIED với data thật 2026-07-09 (report là QUOTED TSV — TsvParser tự strip ngoặc). Date dạng MM/DD/YYYY.",
+  tags: ["staging", "amazon", "inventory_ledger"],
+  bigquery: { partitionBy: "ledger_date", clusterBy: ["msku"] }
+}
+
+-- VERIFIED. Header thật (22 cột): Date, FNSKU, ASIN, MSKU, Title, Disposition,
+-- Location, Store, Starting/Ending Warehouse Balance, In Transit Between
+-- Warehouses, Receipts, Customer Shipments, Customer Returns, Vendor Returns,
+-- Warehouse Transfer In/Out, Found, Lost, Damaged, Disposed, Other Events,
+-- Unknown Events. Movements có thể ÂM (vd Customer Shipments = -1).
+-- Disposition: SELLABLE / CUSTOMER_DAMAGED... (mart cộng MỌI disposition).
+WITH parsed AS (
+  SELECT
+    brand,
+    COALESCE(
+      SAFE_CAST(JSON_VALUE(raw_payload, '$."Date"') AS DATE),
+      SAFE.PARSE_DATE('%m/%d/%Y', JSON_VALUE(raw_payload, '$."Date"'))
+    )                                                                    AS ledger_date,
+    JSON_VALUE(raw_payload, '$."FNSKU"')                                 AS fnsku,
+    JSON_VALUE(raw_payload, '$."ASIN"')                                  AS asin,
+    JSON_VALUE(raw_payload, '$."MSKU"')                                  AS msku,          -- = seller SKU
+    JSON_VALUE(raw_payload, '$."Title"')                                 AS title,
+    JSON_VALUE(raw_payload, '$."Disposition"')                           AS disposition,
+    JSON_VALUE(raw_payload, '$."Location"')                              AS location,      -- COUNTRY (US)
+    JSON_VALUE(raw_payload, '$."Store"')                                 AS store,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Starting Warehouse Balance"') AS INT64)   AS starting_balance,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."In Transit Between Warehouses"') AS INT64) AS in_transit_between_warehouses,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Receipts"') AS INT64)          AS receipts,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Customer Shipments"') AS INT64) AS customer_shipments,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Customer Returns"') AS INT64)  AS customer_returns,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Vendor Returns"') AS INT64)    AS vendor_returns,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Warehouse Transfer In/Out"') AS INT64) AS warehouse_transfer_in_out,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Found"') AS INT64)             AS found,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Lost"') AS INT64)              AS lost,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Damaged"') AS INT64)           AS damaged,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Disposed"') AS INT64)          AS disposed,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Other Events"') AS INT64)      AS other_events,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Unknown Events"') AS INT64)    AS unknown_events,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."Ending Warehouse Balance"') AS INT64)     AS ending_balance,
+    _ingested_at
+  FROM ${ref("raw_amazon_inventory_ledger")}
+  WHERE brand = 'AFW'
+),
+ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY ledger_date, COALESCE(msku,''), COALESCE(fnsku,''),
+                   COALESCE(disposition,''), COALESCE(location,'')
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM parsed
+  WHERE ledger_date IS NOT NULL AND msku IS NOT NULL AND msku != ''
+)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1

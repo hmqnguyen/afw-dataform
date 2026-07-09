@@ -25,6 +25,9 @@ const rawTables = [
   "raw_amazon_browse_node_review_topics",
   "raw_amazon_browse_node_return_topics",
   "raw_amazon_browse_node_return_trends",
+  "raw_amazon_storage_fees",
+  "raw_amazon_inventory_planning",
+  "raw_amazon_inventory_ledger",
 ];
 
 rawTables.forEach(tableName => {

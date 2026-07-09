@@ -1,0 +1,49 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging FBA storage fees (per-ASIN, theo tháng) — nguồn để phân bổ storage về SKU. ⚠️ Tên cột CHƯA verify với data thật.",
+  tags: ["staging", "amazon", "storage_fees"],
+  bigquery: { partitionBy: "month_of_charge", clusterBy: ["fnsku"] }
+}
+
+-- ⚠️⚠️ CHƯA VERIFY VỚI DATA THẬT ⚠️⚠️
+-- Tên cột dưới đây lấy từ Amazon docs cho GET_FBA_STORAGE_FEE_CHARGES_DATA,
+-- CHƯA đối chiếu response thật (bài học Returns: field mapping sai → bảng rỗng).
+-- Trước khi tin: chạy report thật → lấy header raw_payload:
+--   SELECT DISTINCT key FROM `afw_amazon_raw.raw_amazon_storage_fees`,
+--          UNNEST(JSON_KEYS(raw_payload)) AS key;
+-- rồi sửa các JSON path + grain dedup cho khớp.
+WITH parsed AS (
+  SELECT
+    brand,
+    JSON_VALUE(raw_payload, '$.asin')                                    AS asin,
+    JSON_VALUE(raw_payload, '$.fnsku')                                   AS fnsku,
+    JSON_VALUE(raw_payload, '$."product-name"')                          AS product_name,
+    JSON_VALUE(raw_payload, '$."fulfillment-center"')                    AS fulfillment_center,
+    JSON_VALUE(raw_payload, '$."product-size-tier"')                     AS product_size_tier,
+    -- month-of-charge dạng 'YYYY-MM' hoặc tên tháng — VERIFY rồi chọn parser đúng
+    SAFE.PARSE_DATE('%Y-%m', JSON_VALUE(raw_payload, '$."month-of-charge"')) AS month_of_charge,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."average-quantity-on-hand"') AS NUMERIC)     AS avg_quantity_on_hand,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."item-volume"') AS NUMERIC)                  AS item_volume,
+    JSON_VALUE(raw_payload, '$."volume-units"')                          AS volume_units,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."estimated-monthly-storage-fee"') AS NUMERIC) AS estimated_monthly_storage_fee,
+    JSON_VALUE(raw_payload, '$.currency')                               AS currency_code,
+    _ingested_at
+  FROM ${ref("raw_amazon_storage_fees")}
+  WHERE brand = 'AFW'
+),
+ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY month_of_charge, asin, fnsku, fulfillment_center
+      ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM parsed
+  WHERE asin IS NOT NULL AND asin != ''
+)
+SELECT
+  brand, month_of_charge, asin, fnsku, product_name, fulfillment_center,
+  product_size_tier, avg_quantity_on_hand, item_volume, volume_units,
+  estimated_monthly_storage_fee, currency_code, _ingested_at
+FROM ranked
+WHERE rn = 1

@@ -1,0 +1,132 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.mart_dataset,
+  description: "Phân bổ storage fee về SKU theo tồn thực (Inventory Ledger × item_volume). Tháng đã có settlement → ACTUAL (chốt); tháng chưa có (tháng đang chạy / chờ Amazon post đầu tháng sau) → ESTIMATED = TB 3 tháng actual gần nhất × %ngày đã qua. Full-rebuild nên khi settlement về, tháng đó TỰ chuyển ESTIMATED → ACTUAL.",
+  tags: ["mart", "amazon", "storage_allocation"],
+  bigquery: { partitionBy: "usage_month", clusterBy: ["sku"] }
+}
+
+-- =====================================================================
+-- PHÂN BỔ STORAGE — ACTUAL + ESTIMATED (accrual)
+--
+--   allocated_SKU(m) = month_total(m) × driver_SKU(m) / Σ driver(m)
+--
+--   driver(m)     : Σ ngày trong tháng ( EndingWarehouseBalance × item_volume )
+--                   = cubic-foot-days, từ Inventory Ledger DAILY (mọi
+--                   disposition — hàng hỏng vẫn chiếm chỗ).
+--   month_total(m):
+--     • ACTUAL    — tổng storage thật từ settlement. Amazon post phí tháng m
+--                   vào ĐẦU THÁNG m+1 → map posted_month = m+1 về usage m.
+--     • ESTIMATED — tháng CHƯA có actual (tháng đang chạy, hoặc tháng trước
+--                   khi Amazon chưa post): TB cộng 3 tháng ACTUAL gần nhất
+--                   × ( số ngày đã qua / số ngày của tháng ).
+--                   Tháng đã kết thúc nhưng chờ post → %ngày = 100%.
+--
+--   Full-rebuild mỗi lần chạy → ngay khi settlement tháng trước về raw,
+--   tháng đó tự "true-up" sang ACTUAL, số ESTIMATED bị thay hoàn toàn.
+--
+-- ⚠️ Filter '%storage%' trên amount-description cần VERIFY với settlement
+--    thật của account (long-term storage có thể tách dòng riêng).
+-- =====================================================================
+
+WITH
+-- (1) ACTUAL theo tháng sử dụng (usage) — settlement post ở m+1
+actual_by_month AS (
+  SELECT
+    DATE_SUB(DATE_TRUNC(SAFE.PARSE_DATE('%Y-%m-%d',
+      JSON_VALUE(raw_payload, '$."posted-date"')), MONTH), INTERVAL 1 MONTH) AS usage_month,
+    SUM(ABS(SAFE_CAST(JSON_VALUE(raw_payload, '$.amount') AS NUMERIC)))      AS storage_actual_total
+  FROM ${ref("raw_amazon_settlement")}
+  WHERE brand = 'AFW'
+    AND LOWER(JSON_VALUE(raw_payload, '$."amount-description"')) LIKE '%storage%'
+    AND (JSON_VALUE(raw_payload, '$.sku') IS NULL OR JSON_VALUE(raw_payload, '$.sku') = '')
+  GROUP BY 1
+  HAVING usage_month IS NOT NULL
+),
+
+-- (2) Thể tích vật lý per-SKU (thuộc tính cố định, bản ghi mới nhất)
+sku_volume AS (
+  SELECT sku, item_volume
+  FROM ${ref("stg_amazon_inventory_planning")}
+  WHERE item_volume IS NOT NULL AND item_volume > 0
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY sku ORDER BY snapshot_date DESC) = 1
+),
+
+-- (3) Driver: cubic-foot-days theo tháng từ Inventory Ledger (DAILY)
+daily_balance AS (
+  SELECT ledger_date, msku AS sku, SUM(ending_balance) AS qty_end_of_day
+  FROM ${ref("stg_amazon_inventory_ledger")}
+  GROUP BY 1, 2
+),
+sku_driver AS (
+  SELECT
+    DATE_TRUNC(b.ledger_date, MONTH)                        AS usage_month,
+    b.sku,
+    SUM(b.qty_end_of_day)                                   AS quantity_days,
+    SUM(b.qty_end_of_day * COALESCE(v.item_volume, 0))      AS cubic_foot_days,
+    ANY_VALUE(v.item_volume)                                AS item_volume
+  FROM daily_balance b
+  LEFT JOIN sku_volume v USING (sku)
+  WHERE b.qty_end_of_day > 0
+  GROUP BY 1, 2
+),
+driver_total AS (
+  SELECT usage_month, SUM(cubic_foot_days) AS sum_driver
+  FROM sku_driver GROUP BY usage_month
+),
+
+-- (4) month_total mỗi tháng: ACTUAL nếu có; nếu không → ESTIMATED
+--     = TB 3 tháng ACTUAL gần nhất TRƯỚC tháng đó × %ngày đã qua
+month_totals AS (
+  SELECT
+    t.usage_month,
+    a.storage_actual_total,
+    -- TB cộng 3 tháng actual gần nhất trước usage_month
+    (SELECT AVG(a3.storage_actual_total)
+     FROM (SELECT a2.storage_actual_total
+           FROM actual_by_month a2
+           WHERE a2.usage_month < t.usage_month
+           ORDER BY a2.usage_month DESC
+           LIMIT 3) a3)                                     AS avg_last_3_actual,
+    -- % ngày đã qua: tháng đã kết thúc → 1.0; tháng đang chạy → ngày đã qua/số ngày tháng
+    CASE
+      WHEN t.usage_month < DATE_TRUNC(CURRENT_DATE(), MONTH) THEN 1.0
+      ELSE SAFE_DIVIDE(
+        DATE_DIFF(CURRENT_DATE(), t.usage_month, DAY),
+        EXTRACT(DAY FROM LAST_DAY(t.usage_month)))
+    END                                                     AS pct_month_elapsed
+  FROM driver_total t
+  LEFT JOIN actual_by_month a USING (usage_month)
+),
+month_totals_final AS (
+  SELECT
+    usage_month,
+    IF(storage_actual_total IS NOT NULL, 'ACTUAL', 'ESTIMATED')   AS allocation_status,
+    COALESCE(
+      storage_actual_total,
+      ROUND(avg_last_3_actual * pct_month_elapsed, 2))            AS month_total,
+    pct_month_elapsed
+  FROM month_totals
+  WHERE storage_actual_total IS NOT NULL
+     OR avg_last_3_actual IS NOT NULL   -- chưa đủ actual lịch sử → chưa ước tính được
+)
+
+SELECT
+  d.usage_month,
+  'AFW'                                                     AS brand,
+  'Amazon'                                                  AS channel,
+  d.sku,
+  m.allocation_status,                                      -- ACTUAL | ESTIMATED
+  m.pct_month_elapsed,
+  d.quantity_days,
+  d.item_volume,
+  d.cubic_foot_days                                         AS driver_value,
+  SAFE_DIVIDE(d.cubic_foot_days, t.sum_driver)              AS allocation_ratio,
+  m.month_total                                             AS storage_month_total,
+  ROUND(m.month_total
+        * SAFE_DIVIDE(d.cubic_foot_days, t.sum_driver), 4)  AS allocated_storage_fee,
+  CURRENT_TIMESTAMP()                                       AS _allocated_at
+FROM sku_driver d
+JOIN driver_total t USING (usage_month)
+JOIN month_totals_final m USING (usage_month)
+WHERE d.cubic_foot_days > 0
