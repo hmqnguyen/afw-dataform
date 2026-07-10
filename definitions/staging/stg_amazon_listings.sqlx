@@ -1,0 +1,38 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "Staging Merchant Listings ALL — snapshot theo NGÀY (snapshot_date = DATE(_ingested_at)). Mỗi SKU 1 dòng/ngày → dựng chuỗi giá list để theo dõi biến động. ⚠️ Tên cột lấy từ docs report, verify với data thật.",
+  tags: ["staging", "amazon", "listings"],
+  bigquery: { partitionBy: "snapshot_date", clusterBy: ["seller_sku"] }
+}
+
+-- ⚠️ CHƯA VERIFY: header GET_MERCHANT_LISTINGS_ALL_DATA (lowercase-hyphen).
+-- Lấy header thật: SELECT DISTINCT k FROM raw, UNNEST(JSON_KEYS(raw_payload)) k;
+WITH parsed AS (
+  SELECT
+    brand,
+    DATE(_ingested_at)                                          AS snapshot_date,
+    JSON_VALUE(raw_payload, '$."seller-sku"')                   AS seller_sku,
+    JSON_VALUE(raw_payload, '$."asin1"')                        AS asin,
+    JSON_VALUE(raw_payload, '$."item-name"')                    AS item_name,
+    JSON_VALUE(raw_payload, '$."listing-id"')                   AS listing_id,
+    JSON_VALUE(raw_payload, '$."product-id"')                   AS product_id,
+    JSON_VALUE(raw_payload, '$."item-condition"')               AS item_condition,
+    JSON_VALUE(raw_payload, '$."fulfillment-channel"')          AS fulfillment_channel,  -- DEFAULT=FBM, AMAZON_*=FBA
+    JSON_VALUE(raw_payload, '$."status"')                       AS status,               -- Active/Inactive/Incomplete
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."price"') AS NUMERIC)   AS price,                -- giá list hiện tại
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."quantity"') AS INT64)  AS quantity,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."open-date"') AS TIMESTAMP) AS open_date,
+    _ingested_at
+  FROM ${ref("raw_amazon_listings")}
+  WHERE brand = 'AFW'
+),
+ranked AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY snapshot_date, seller_sku ORDER BY _ingested_at DESC
+    ) AS rn
+  FROM parsed
+  WHERE seller_sku IS NOT NULL AND seller_sku != ''
+)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1

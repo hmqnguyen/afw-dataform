@@ -1,0 +1,53 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.mart_dataset,
+  description: "Theo dõi biến động giá list Amazon theo ngày. So giá mỗi SKU với snapshot NGAY TRƯỚC, tính delta + %thay đổi, gắn cờ WITHIN_RANGE / OUT_OF_RANGE theo ngưỡng %. Hook sẵn floor/ceiling per-SKU từ Airtable (khi có).",
+  tags: ["mart", "amazon", "price_monitoring"],
+  bigquery: { partitionBy: "snapshot_date", clusterBy: ["seller_sku"] }
+}
+
+js {
+  // Ngưỡng %thay đổi/ngày được coi là "trong phạm vi cho phép".
+  // Vượt |Δ%| này so với ngày trước → OUT_OF_RANGE.
+  const ALLOWED_DAILY_PCT_CHANGE = 0.15;   // 15%
+}
+
+WITH daily AS (
+  SELECT snapshot_date, seller_sku, asin, item_name, status, fulfillment_channel, price
+  FROM ${ref("stg_amazon_listings")}
+  WHERE price IS NOT NULL
+),
+with_prev AS (
+  SELECT
+    *,
+    LAG(price)         OVER (PARTITION BY seller_sku ORDER BY snapshot_date) AS prev_price,
+    LAG(snapshot_date) OVER (PARTITION BY seller_sku ORDER BY snapshot_date) AS prev_snapshot_date
+  FROM daily
+)
+SELECT
+  snapshot_date,
+  prev_snapshot_date,
+  'AFW'                                                        AS brand,
+  'Amazon'                                                     AS channel,
+  seller_sku,
+  asin,
+  item_name,
+  status,
+  fulfillment_channel,
+  prev_price,
+  price                                                        AS current_price,
+  ROUND(price - prev_price, 2)                                 AS price_delta,
+  ROUND(SAFE_DIVIDE(price - prev_price, prev_price) * 100, 2)  AS price_change_pct,
+  CASE
+    WHEN prev_price IS NULL           THEN 'FIRST_SEEN'
+    WHEN price = prev_price           THEN 'UNCHANGED'
+    WHEN ABS(SAFE_DIVIDE(price - prev_price, prev_price)) > ${ALLOWED_DAILY_PCT_CHANGE}
+                                      THEN 'OUT_OF_RANGE'
+    ELSE 'WITHIN_RANGE'
+  END                                                          AS price_change_status,
+  -- TODO khi Airtable→BQ sync sẵn: LEFT JOIN map_min_price/map_max_price per SKU
+  --   → cờ BELOW_FLOOR / ABOVE_CEILING theo giá sàn/trần tuyệt đối (MAP).
+  CURRENT_TIMESTAMP()                                          AS _monitored_at
+FROM with_prev
+-- Chỉ giữ dòng CÓ thay đổi giá (bỏ UNCHANGED cho gọn; bỏ WHERE nếu muốn full lịch sử)
+WHERE prev_price IS NULL OR price != prev_price

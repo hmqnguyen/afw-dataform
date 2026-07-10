@@ -28,6 +28,7 @@ const rawTables = [
   "raw_amazon_storage_fees",
   "raw_amazon_inventory_planning",
   "raw_amazon_inventory_ledger",
+  "raw_amazon_listings",
 ];
 
 rawTables.forEach(tableName => {
