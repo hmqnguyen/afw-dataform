@@ -1,0 +1,21 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master (latest-state) — SKU MASTER: listing hiện tại mỗi SKU (SKU↔ASIN↔item-name↔status↔giá mới nhất). Nguồn: stg_amazon_listings (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(snapshot_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  tags: ["master", "amazon", "listings"],
+  bigquery: { clusterBy: ["seller_sku"] }
+}
+
+-- Latest-state: giữ dòng MỚI NHẤT (theo snapshot_date) cho mỗi seller_sku.
+-- Nhất quán với hướng B: mọi domain đều có master trả về TRẠNG THÁI HIỆN TẠI.
+SELECT * EXCEPT(_rn)
+FROM (
+  SELECT
+    s.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY seller_sku
+      ORDER BY snapshot_date DESC
+    ) AS _rn
+  FROM ${ref("stg_amazon_listings")} AS s
+)
+WHERE _rn = 1

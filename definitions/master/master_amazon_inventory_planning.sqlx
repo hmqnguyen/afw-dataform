@@ -1,8 +1,8 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master (latest-state) — tồn kho FBA hiện tại mỗi SKU. Nguồn: stg_amazon_inventory (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(snapshot_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
-  tags: ["master", "amazon", "inventory"],
+  description: "Master (latest-state) — chỉ số planning hiện tại mỗi SKU (days-of-supply, sell-through, storage est, aged). Nguồn: stg_amazon_inventory_planning (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(snapshot_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  tags: ["master", "amazon", "inventory_planning"],
   bigquery: { clusterBy: ["sku"] }
 }
 
@@ -16,6 +16,6 @@ FROM (
       PARTITION BY sku
       ORDER BY snapshot_date DESC
     ) AS _rn
-  FROM ${ref("stg_amazon_inventory")} AS s
+  FROM ${ref("stg_amazon_inventory_planning")} AS s
 )
 WHERE _rn = 1

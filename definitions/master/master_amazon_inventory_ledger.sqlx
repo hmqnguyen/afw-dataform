@@ -1,0 +1,21 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master (latest-state) — vị thế tồn kho hiện tại mỗi (SKU × disposition) — Ending Warehouse Balance ngày mới nhất. Nguồn: stg_amazon_inventory_ledger (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(ledger_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  tags: ["master", "amazon", "inventory_ledger"],
+  bigquery: { clusterBy: ["msku"] }
+}
+
+-- Latest-state: giữ dòng MỚI NHẤT (theo ledger_date) cho mỗi msku × disposition × location.
+-- Nhất quán với hướng B: mọi domain đều có master trả về TRẠNG THÁI HIỆN TẠI.
+SELECT * EXCEPT(_rn)
+FROM (
+  SELECT
+    s.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY msku, disposition, location
+      ORDER BY ledger_date DESC
+    ) AS _rn
+  FROM ${ref("stg_amazon_inventory_ledger")} AS s
+)
+WHERE _rn = 1
