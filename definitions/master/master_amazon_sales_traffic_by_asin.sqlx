@@ -1,0 +1,53 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  name: "master_amazon_sales_traffic_by_asin",
+  description: "Master Sales & Traffic cap SKU. Grain: report_date x sku. Nguon cho mart traffic/conversion.",
+  tags: ["amazon", "sales_traffic", "master"],
+  uniqueKey: ["dedup_key"],
+  bigquery: {
+    partitionBy: "report_date",
+    clusterBy: ["sku", "child_asin"]
+  },
+  assertions: {
+    uniqueKey: ["dedup_key"],
+    nonNull: ["report_date", "dedup_key"]
+  }
+}
+
+pre_operations {
+  CREATE TABLE IF NOT EXISTS ${self()} (
+    report_date           DATE,
+    report_id             STRING,
+    _ingested_at          TIMESTAMP,
+    parent_asin           STRING,
+    child_asin            STRING,
+    sku                   STRING,
+    dedup_key             STRING,
+    units_ordered         INT64,
+    units_ordered_b2b     INT64,
+    ordered_product_sales NUMERIC,
+    currency_code         STRING,
+    total_order_items     INT64,
+    sessions              INT64,
+    browser_sessions      INT64,
+    mobile_app_sessions   INT64,
+    page_views            INT64,
+    session_share_pct     FLOAT64,
+    page_view_share_pct   FLOAT64,
+    buy_box_pct           FLOAT64,
+    unit_session_pct      FLOAT64,
+    _loaded_at            TIMESTAMP
+  )
+  PARTITION BY report_date
+  CLUSTER BY sku, child_asin
+}
+
+SELECT
+  s.*,
+  CURRENT_TIMESTAMP() AS _loaded_at
+FROM ${ref("stg_amazon_sales_traffic_by_asin")} s
+
+${when(incremental(), `
+WHERE s.report_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+`)}

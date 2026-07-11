@@ -1,21 +1,15 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master (latest-state) — phí lưu kho tháng gần nhất mỗi ASIN. Nguồn: stg_amazon_storage_fees (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(month_of_charge) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  description: "Master — phí lưu kho per-ASIN. GIỮ TOÀN BỘ LỊCH SỬ (mọi month_of_charge) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(month_of_charge)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "storage_fees"],
-  bigquery: { clusterBy: ["asin"] }
+  bigquery: { partitionBy: "month_of_charge", clusterBy: ["asin"] }
 }
 
--- Latest-state: giữ dòng MỚI NHẤT (theo month_of_charge) cho mỗi asin.
--- Nhất quán với hướng B: mọi domain đều có master trả về TRẠNG THÁI HIỆN TẠI.
-SELECT * EXCEPT(_rn)
-FROM (
-  SELECT
-    s.*,
-    ROW_NUMBER() OVER (
-      PARTITION BY asin
-      ORDER BY month_of_charge DESC
-    ) AS _rn
-  FROM ${ref("stg_amazon_storage_fees")} AS s
-)
-WHERE _rn = 1
+-- I1 (strict layer invariant): mart/fact CHỈ đọc master → master phải giữ ĐỦ
+-- chiều thời gian (time-series), không chỉ latest-state. Cột is_latest cho phép
+-- truy xuất "trạng thái hiện tại" nhất quán mà không cần MAX(month_of_charge) mỗi query.
+SELECT
+  s.*,
+  (month_of_charge = MAX(month_of_charge) OVER (PARTITION BY asin, fnsku, fulfillment_center)) AS is_latest
+FROM ${ref("stg_amazon_storage_fees")} AS s

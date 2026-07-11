@@ -36,7 +36,7 @@ WITH revenue_agg AS (
     COUNTIF(fulfillment_channel = 'Amazon')                              AS fba_item_count,
     COUNTIF(fulfillment_channel = 'Merchant')                            AS fbm_item_count,
     COUNTIF(is_pending_price_missing)                                    AS pending_price_missing_count
-  FROM ${ref("stg_amazon_orders")}
+  FROM ${ref("master_amazon_orders")}
   WHERE order_date >= target_date_start
   GROUP BY brand, sku, order_date
 ),
@@ -65,7 +65,7 @@ fees_agg AS (
       AND transaction_type != 'Refund',
       amount, 0))                                                        AS other_fees,
     SUM(amount)                                                          AS total_settlement_amount
-  FROM ${ref("stg_amazon_settlement")}
+  FROM ${ref("master_amazon_settlement")}
   WHERE posted_date >= target_date_start
   GROUP BY brand, sku, posted_date
 ),
@@ -80,14 +80,14 @@ returns_agg AS (
   FROM (
     -- FBM/MFN returns (có refund $, RMA) — stg_amazon_returns
     SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
-    FROM ${ref("stg_amazon_returns")}
+    FROM ${ref("master_amazon_returns")}
     WHERE return_date >= target_date_start
     UNION ALL
     -- FBA returns (đơn vị vật lý nhận về kho) — stg_amazon_fba_returns.
     -- Population TÁCH BIỆT với FBM (đơn FBA không có trong report FBM) →
     -- union không double-count.
     SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
-    FROM ${ref("stg_amazon_fba_returns")}
+    FROM ${ref("master_amazon_fba_returns")}
     WHERE return_date >= target_date_start
   )
   GROUP BY brand, sku, day

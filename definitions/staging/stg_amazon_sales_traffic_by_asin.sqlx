@@ -1,0 +1,112 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  uniqueKey: ["dedup_key"],
+  name: "stg_amazon_sales_traffic_by_asin",
+  description: "Sales & Traffic cap SKU. Grain: report_date x sku.",
+  tags: ["amazon", "sales_traffic", "staging"],
+  assertions: {
+    uniqueKey: ["dedup_key"],
+    nonNull: ["report_date", "dedup_key"]
+  }
+}
+
+pre_operations {
+  -- Watermark: chỉ quét raw MỚI. Dùng biến (không subquery inline) để
+  -- BigQuery prune được partition. Full-refresh → checkpoint 1970 → rebuild.
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
+}
+
+/*
+  GRAIN: payload KHONG co truong date. report_date den tu cot raw (service ghi theo
+  ngay da REQUEST). Neu ai do sua service de request nhieu ngay 1 lan, grain nay
+  VO HIEU va so lieu se cong don sai. Dung sua.
+
+  sku CO THE NULL khi listing khong co seller-SKU. Dung sku lam khoa se mat dong
+  -> dung dedup_key co fallback (cung nguyen tac voi fee_key ben settlement).
+*/
+
+WITH parsed AS (
+  SELECT
+    report_date,
+    report_id,
+    _ingested_at,
+
+    JSON_VALUE(raw_payload, '$.parentAsin') AS parent_asin,
+    JSON_VALUE(raw_payload, '$.childAsin')  AS child_asin,
+    JSON_VALUE(raw_payload, '$.sku')        AS sku_raw,   -- nguyên văn từ Amazon
+
+    -- ⚠️ CHUẨN HOÁ SKU (verify với payload thật 2026-07-11). Amazon trả SKU BẨN:
+    --     'amzn.gr.FBA-200100-5z72pSmiaS75ce-xww-VG'  → SKU Amazon tự sinh
+    --     '901060'                                    → thiếu tiền tố FBA-
+    --     'FBA- 901210' / 'FBA -815250'               → thừa dấu cách
+    -- Không chuẩn hoá → join với master_amazon_listings / fact_sku_pnl_daily ra
+    -- NULL → mart rỗng/sai MÀ KHÔNG BÁO LỖI (bẫy im lặng).
+    (
+      SELECT
+        -- 1) bóc SKU thật khỏi vỏ amzn.gr.<SKU>-<hash>
+        -- 2) bỏ MỌI khoảng trắng
+        -- 3) thêm tiền tố FBA- nếu chỉ còn phần số
+        CASE
+          WHEN core IS NULL OR core = '' THEN NULL
+          WHEN REGEXP_CONTAINS(core, r'^[0-9]+$') THEN CONCAT('FBA-', core)
+          ELSE core
+        END
+      FROM (
+        SELECT REGEXP_REPLACE(
+          COALESCE(
+            -- vỏ amzn.gr.FBA-200100-<hash> → lấy 'FBA-200100'
+            REGEXP_EXTRACT(JSON_VALUE(raw_payload, '$.sku'), r'^amzn\.[a-z]+\.(.+?)-[A-Za-z0-9]{10,}'),
+            JSON_VALUE(raw_payload, '$.sku')
+          ),
+          r'\s+', ''                       -- bỏ mọi khoảng trắng: 'FBA- 901210' → 'FBA-901210'
+        ) AS core
+      )
+    )                                       AS sku,   -- SKU đã chuẩn hoá — DÙNG CÁI NÀY để join
+
+    CONCAT(
+      CAST(report_date AS STRING), '|',
+      COALESCE(
+        JSON_VALUE(raw_payload, '$.sku'),
+        JSON_VALUE(raw_payload, '$.childAsin'),
+        JSON_VALUE(raw_payload, '$.parentAsin'),
+        'UNKNOWN'
+      )
+    ) AS dedup_key,
+
+    -- SALES
+    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrdered')               AS INT64)   AS units_ordered,
+    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrderedB2B')            AS INT64)   AS units_ordered_b2b,
+    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.orderedProductSales.amount') AS NUMERIC) AS ordered_product_sales,
+    JSON_VALUE(raw_payload, '$.salesByAsin.orderedProductSales.currencyCode')            AS currency_code,
+    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.totalOrderItems')            AS INT64)   AS total_order_items,
+
+    -- TRAFFIC
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessions')                 AS INT64)   AS sessions,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.browserSessions')          AS INT64)   AS browser_sessions,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.mobileAppSessions')        AS INT64)   AS mobile_app_sessions,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViews')                AS INT64)   AS page_views,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessionPercentage')        AS FLOAT64) AS session_share_pct,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViewsPercentage')      AS FLOAT64) AS page_view_share_pct,
+
+    -- 2 chi so quyet dinh
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.buyBoxPercentage')         AS FLOAT64) AS buy_box_pct,
+    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.unitSessionPercentage')    AS FLOAT64) AS unit_session_pct
+
+  FROM ${ref("raw_amazon_sales_traffic_by_asin")}
+  WHERE brand = 'AFW'
+    AND _ingested_at > ingested_at_checkpoint   -- watermark
+),
+
+deduped AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY _ingested_at DESC) AS rn
+  FROM parsed
+)
+
+SELECT * EXCEPT (rn)
+FROM deduped
+WHERE rn = 1

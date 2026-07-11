@@ -1,21 +1,15 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master (latest-state) — vị thế tồn kho hiện tại mỗi (SKU × disposition) — Ending Warehouse Balance ngày mới nhất. Nguồn: stg_amazon_inventory_ledger (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(ledger_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  description: "Master — sổ cái tồn kho DAILY. GIỮ TOÀN BỘ LỊCH SỬ (mọi ledger_date) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(ledger_date)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "inventory_ledger"],
-  bigquery: { clusterBy: ["msku"] }
+  bigquery: { partitionBy: "ledger_date", clusterBy: ["msku"] }
 }
 
--- Latest-state: giữ dòng MỚI NHẤT (theo ledger_date) cho mỗi msku × disposition × location.
--- Nhất quán với hướng B: mọi domain đều có master trả về TRẠNG THÁI HIỆN TẠI.
-SELECT * EXCEPT(_rn)
-FROM (
-  SELECT
-    s.*,
-    ROW_NUMBER() OVER (
-      PARTITION BY msku, disposition, location
-      ORDER BY ledger_date DESC
-    ) AS _rn
-  FROM ${ref("stg_amazon_inventory_ledger")} AS s
-)
-WHERE _rn = 1
+-- I1 (strict layer invariant): mart/fact CHỈ đọc master → master phải giữ ĐỦ
+-- chiều thời gian (time-series), không chỉ latest-state. Cột is_latest cho phép
+-- truy xuất "trạng thái hiện tại" nhất quán mà không cần MAX(ledger_date) mỗi query.
+SELECT
+  s.*,
+  (ledger_date = MAX(ledger_date) OVER (PARTITION BY msku, fnsku, disposition, location)) AS is_latest
+FROM ${ref("stg_amazon_inventory_ledger")} AS s

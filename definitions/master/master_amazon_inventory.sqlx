@@ -1,21 +1,15 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master (latest-state) — tồn kho FBA hiện tại mỗi SKU. Nguồn: stg_amazon_inventory (snapshot theo ngày). Query 'hiện tại' đọc bảng NÀY (1 dòng/entity), khỏi phải MAX(snapshot_date) trên staging. Lịch sử đầy đủ vẫn ở staging.",
+  description: "Master — tồn kho FBA. GIỮ TOÀN BỘ LỊCH SỬ (mọi snapshot_date) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(snapshot_date)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "inventory"],
-  bigquery: { clusterBy: ["sku"] }
+  bigquery: { partitionBy: "snapshot_date", clusterBy: ["sku"] }
 }
 
--- Latest-state: giữ dòng MỚI NHẤT (theo snapshot_date) cho mỗi sku.
--- Nhất quán với hướng B: mọi domain đều có master trả về TRẠNG THÁI HIỆN TẠI.
-SELECT * EXCEPT(_rn)
-FROM (
-  SELECT
-    s.*,
-    ROW_NUMBER() OVER (
-      PARTITION BY sku
-      ORDER BY snapshot_date DESC
-    ) AS _rn
-  FROM ${ref("stg_amazon_inventory")} AS s
-)
-WHERE _rn = 1
+-- I1 (strict layer invariant): mart/fact CHỈ đọc master → master phải giữ ĐỦ
+-- chiều thời gian (time-series), không chỉ latest-state. Cột is_latest cho phép
+-- truy xuất "trạng thái hiện tại" nhất quán mà không cần MAX(snapshot_date) mỗi query.
+SELECT
+  s.*,
+  (snapshot_date = MAX(snapshot_date) OVER (PARTITION BY sku)) AS is_latest
+FROM ${ref("stg_amazon_inventory")} AS s

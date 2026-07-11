@@ -1,0 +1,9 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.master_dataset,
+  description: "Master FBA returns — audit trail đơn vị vật lý nhận về kho (license-plate). Fact đọc bảng này (I1).",
+  tags: ["master", "amazon", "fba_returns"],
+  bigquery: { partitionBy: "return_date", clusterBy: ["sku"] }
+}
+
+SELECT * FROM ${ref("stg_amazon_fba_returns")}

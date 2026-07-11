@@ -1,0 +1,74 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  uniqueKey: ["fee_key"],
+  description: "Staging phí settlement CẤP TÀI KHOẢN (dòng sku IS NULL) — grain bị stg_amazon_settlement cố ý lọc bỏ. Nguồn để mart phân bổ (storage, subscription, ads...) mà KHÔNG phải đọc raw (invariant I1).",
+  tags: ["staging", "amazon", "settlement_fees"],
+  bigquery: { partitionBy: "posted_date" }
+}
+
+pre_operations {
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
+}
+
+-- Vì sao tồn tại bảng này (I1 root-cause):
+--   mart_sku_storage_allocated cần TỔNG storage thật, nhưng dòng storage trong
+--   settlement KHÔNG có sku → bị stg_amazon_settlement lọc (WHERE sku IS NOT NULL).
+--   Thay vì để mart đọc raw (vi phạm I1), tạo staging riêng cho GRAIN BỊ RƠI.
+--
+-- G7 (NULL-safe dedup key): sku NULL → không dùng được làm khoá. Dựng fee_key
+--   tổng hợp từ các trường luôn có, COALESCE mọi thành phần có thể NULL.
+WITH parsed AS (
+  SELECT
+    brand,
+    JSON_VALUE(raw_payload, '$."settlement-id"')                        AS settlement_id,
+    JSON_VALUE(raw_payload, '$."transaction-type"')                     AS transaction_type,
+    JSON_VALUE(raw_payload, '$."amount-type"')                          AS amount_type,
+    JSON_VALUE(raw_payload, '$."amount-description"')                   AS amount_description,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.amount') AS NUMERIC)            AS amount,
+    JSON_VALUE(raw_payload, '$."order-id"')                             AS amazon_order_id,
+    SAFE.PARSE_DATE('%Y-%m-%d', JSON_VALUE(raw_payload, '$."posted-date"')) AS posted_date,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP)  AS posted_date_time,
+    _ingested_at
+  FROM ${ref("raw_amazon_settlement")}
+  WHERE brand = 'AFW'
+    -- CHỈ dòng KHÔNG có sku (phần bù của stg_amazon_settlement)
+    AND (JSON_VALUE(raw_payload, '$.sku') IS NULL OR JSON_VALUE(raw_payload, '$.sku') = '')
+    -- bỏ dòng HEADER (không có amount-type, chỉ mang total-amount)
+    AND JSON_VALUE(raw_payload, '$."amount-type"') IS NOT NULL
+    AND _ingested_at > ingested_at_checkpoint
+),
+keyed AS (
+  SELECT
+    *,
+    -- fee_key: NULL-safe surrogate key (G7)
+    TO_HEX(MD5(CONCAT(
+      COALESCE(settlement_id,''), '|', COALESCE(transaction_type,''), '|',
+      COALESCE(amount_type,''),   '|', COALESCE(amount_description,''), '|',
+      COALESCE(amazon_order_id,''),'|', COALESCE(CAST(amount AS STRING),''), '|',
+      COALESCE(CAST(posted_date_time AS STRING),'')
+    )))                                                                  AS fee_key,
+    -- cost_group theo taxonomy (handoff §5) — dòng chưa map = UNMAPPED (cờ đỏ,
+    -- để Amazon thêm phí mới không âm thầm sai P&L)
+    CASE
+      WHEN LOWER(amount_description) LIKE '%storage%'         THEN 'LOGISTICS'
+      WHEN LOWER(amount_description) LIKE '%advertis%'        THEN 'MARKETING'
+      WHEN LOWER(amount_description) LIKE '%subscription%'    THEN 'EXCLUDED'
+      WHEN LOWER(amount_description) LIKE '%reserve%'         THEN 'EXCLUDED'
+      WHEN LOWER(amount_description) LIKE '%placement%'       THEN 'LOGISTICS'
+      WHEN LOWER(amount_description) LIKE '%shipping label%'  THEN 'RETURNS'
+      WHEN LOWER(amount_description) LIKE '%coupon%'          THEN 'MARKETING'
+      WHEN LOWER(amount_description) LIKE '%adjustment%'      THEN 'EXCLUDED'
+      ELSE 'UNMAPPED'
+    END                                                                  AS cost_group
+  FROM parsed
+),
+ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY fee_key ORDER BY _ingested_at DESC) AS rn
+  FROM keyed
+)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1

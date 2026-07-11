@@ -1,10 +1,33 @@
 config {
-  type: "table",
+  type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  uniqueKey: ["ledger_date", "msku", "fnsku", "disposition", "location"],
   description: "Staging Inventory Ledger Summary (DAILY, per FNSKU/MSKU/Disposition) — số lượng tồn theo ngày chuẩn audit. VERIFIED với data thật 2026-07-09 (report là QUOTED TSV — TsvParser tự strip ngoặc). Date dạng MM/DD/YYYY.",
   tags: ["staging", "amazon", "inventory_ledger"],
   bigquery: { partitionBy: "ledger_date", clusterBy: ["msku"] }
+
 }
+
+pre_operations {
+  -- Checkpoint watermark. Lần chạy ĐẦU / --full-refresh: Dataform bỏ qua
+  -- nhánh incremental() → checkpoint = 1970 → nạp TOÀN BỘ raw (build lại từ
+  -- đầu). Các lần sau: checkpoint = _ingested_at lớn nhất đã xử lý.
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
+}
+
+
+-- INCREMENTAL + WATERMARK trên _ingested_at:
+--   • Chạy thường: CHỈ quét raw MỚI (_ingested_at > watermark) → không quét lại
+--     toàn bộ lịch sử raw (raw append-only, phình dần theo thời gian).
+--   • Dedup 2 tầng: (a) ROW_NUMBER khử trùng TRONG batch mới; (b) Dataform MERGE
+--     theo uniqueKey khử trùng XUYÊN batch — bản mới ghi đè bản cũ (latest-wins
+--     giữ nguyên, vì raw mới luôn có _ingested_at lớn hơn).
+--   • Sửa logic staging / nạp raw cũ (backfill) → chạy `dataform run --full-refresh`
+--     (bỏ qua watermark, rebuild toàn bộ). Chunk chồng biên vẫn an toàn nhờ MERGE.
 
 -- VERIFIED. Header thật (22 cột): Date, FNSKU, ASIN, MSKU, Title, Disposition,
 -- Location, Store, Starting/Ending Warehouse Balance, In Transit Between
@@ -43,6 +66,10 @@ WITH parsed AS (
     _ingested_at
   FROM ${ref("raw_amazon_inventory_ledger")}
   WHERE brand = 'AFW'
+    -- watermark: chỉ lấy raw MỚI kể từ lần chạy trước. Dùng BIẾN (khai báo
+    -- ở pre_operations) thay vì subquery inline → BigQuery coi là hằng số
+    -- nên PRUNE được partition của raw (subquery inline sẽ full-scan).
+    AND _ingested_at > ingested_at_checkpoint
 ),
 ranked AS (
   SELECT *,

@@ -29,6 +29,8 @@ const rawTables = [
   "raw_amazon_inventory_planning",
   "raw_amazon_inventory_ledger",
   "raw_amazon_listings",
+  "raw_amazon_sales_traffic_by_date",
+  "raw_amazon_sales_traffic_by_asin",
 ];
 
 rawTables.forEach(tableName => {

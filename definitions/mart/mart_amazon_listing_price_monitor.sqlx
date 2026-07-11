@@ -14,7 +14,7 @@ js {
 
 WITH daily AS (
   SELECT snapshot_date, seller_sku, asin, item_name, status, fulfillment_channel, price
-  FROM ${ref("stg_amazon_listings")}
+  FROM ${ref("master_amazon_listings")}
   WHERE price IS NOT NULL
 ),
 with_prev AS (

@@ -1,0 +1,76 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  uniqueKey: ["report_date"],
+  name: "stg_amazon_sales_traffic_by_date",
+  description: "Sales & Traffic cap KENH, 1 dong/ngay. Parse verbatim JSON tu raw.",
+  tags: ["amazon", "sales_traffic", "staging"],
+  assertions: {
+    uniqueKey: ["report_date"],
+    nonNull: ["report_date"]
+  }
+}
+
+pre_operations {
+  -- Watermark: chỉ quét raw MỚI. Dùng biến (không subquery inline) để
+  -- BigQuery prune được partition. Full-refresh → checkpoint 1970 → rebuild.
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
+}
+
+/*
+  VERIFY payload that: ten field Amazon la camelCase.
+  Neu C# service lo serialize qua object -> PascalCase -> MOI JSON_VALUE tra NULL.
+  Kiem tra ngay sau lan sync dau:
+      SELECT raw_payload FROM raw_amazon_sales_traffic_by_date LIMIT 1;
+
+  DEDUP: Amazon RESTATE du lieu 2-3 ngay dau (loc bot traffic).
+         Lay ban ghi _ingested_at MOI NHAT cho moi report_date.
+*/
+
+WITH deduped AS (
+  SELECT
+    report_date, report_id, raw_payload, _ingested_at,
+    ROW_NUMBER() OVER (PARTITION BY report_date ORDER BY _ingested_at DESC) AS rn
+  FROM ${ref("raw_amazon_sales_traffic_by_date")}
+  WHERE brand = 'AFW'
+    AND _ingested_at > ingested_at_checkpoint   -- watermark
+)
+
+SELECT
+  report_date,
+  report_id,
+
+  -- SALES
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSales.amount')    AS NUMERIC) AS ordered_product_sales,
+  JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSales.currencyCode')               AS currency_code,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSalesB2B.amount') AS NUMERIC) AS ordered_product_sales_b2b,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrdered')                  AS INT64)   AS units_ordered,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrderedB2B')               AS INT64)   AS units_ordered_b2b,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.totalOrderItems')               AS INT64)   AS total_order_items,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.averageSellingPrice.amount')    AS NUMERIC) AS avg_selling_price,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsRefunded')                 AS INT64)   AS units_refunded,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.refundRate')                    AS FLOAT64) AS refund_rate_pct,
+  CAST(JSON_VALUE(raw_payload, '$.salesByDate.claimsGranted')                 AS INT64)   AS claims_granted,
+
+  -- TRAFFIC
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.sessions')                    AS INT64)   AS sessions,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.browserSessions')             AS INT64)   AS browser_sessions,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.mobileAppSessions')           AS INT64)   AS mobile_app_sessions,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.pageViews')                   AS INT64)   AS page_views,
+
+  -- 3 chi so vang
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.buyBoxPercentage')            AS FLOAT64) AS buy_box_pct,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.unitSessionPercentage')       AS FLOAT64) AS unit_session_pct,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.orderItemSessionPercentage')  AS FLOAT64) AS order_item_session_pct,
+
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.averageOfferCount')           AS INT64)   AS avg_offer_count,
+  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.negativeFeedbackReceived')    AS INT64)   AS negative_feedback,
+
+  _ingested_at
+
+FROM deduped
+WHERE rn = 1

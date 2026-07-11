@@ -1,0 +1,61 @@
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.master_dataset,
+  name: "master_amazon_sales_traffic_by_date",
+  description: "Master Sales & Traffic cap kenh. Latest-state theo report_date.",
+  tags: ["amazon", "sales_traffic", "master"],
+  uniqueKey: ["report_date"],
+  bigquery: {
+    partitionBy: "report_date",
+    clusterBy: ["report_id"]
+  },
+  assertions: {
+    uniqueKey: ["report_date"],
+    nonNull: ["report_date"]
+  }
+}
+
+pre_operations {
+  /*
+    Dataform incremental() self-join se HONG o lan chay dau khi bang chua ton tai.
+    Bat buoc CREATE TABLE IF NOT EXISTS truoc (cung pattern voi cac master khac).
+  */
+  CREATE TABLE IF NOT EXISTS ${self()} (
+    report_date               DATE,
+    report_id                 STRING,
+    ordered_product_sales     NUMERIC,
+    currency_code             STRING,
+    ordered_product_sales_b2b NUMERIC,
+    units_ordered             INT64,
+    units_ordered_b2b         INT64,
+    total_order_items         INT64,
+    avg_selling_price         NUMERIC,
+    units_refunded            INT64,
+    refund_rate_pct           FLOAT64,
+    claims_granted            INT64,
+    sessions                  INT64,
+    browser_sessions          INT64,
+    mobile_app_sessions       INT64,
+    page_views                INT64,
+    buy_box_pct               FLOAT64,
+    unit_session_pct          FLOAT64,
+    order_item_session_pct    FLOAT64,
+    avg_offer_count           INT64,
+    negative_feedback         INT64,
+    _loaded_at                TIMESTAMP
+  )
+  PARTITION BY report_date
+}
+
+SELECT
+  s.*,
+  CURRENT_TIMESTAMP() AS _loaded_at
+FROM ${ref("stg_amazon_sales_traffic_by_date")} s
+
+${when(incremental(), `
+/*
+  Cua so xu ly lai 35 ngay: khop voi fact_sku_pnl_daily.
+  Amazon restate ~3 ngay, nhung de rong de bat ca truong hop backfill.
+*/
+WHERE s.report_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+`)}

@@ -1,0 +1,55 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.mart_dataset,
+  name: "mart_amazon_buybox_daily",
+  description: "Theo doi Buy Box hang ngay theo SKU + uoc luong doanh thu mat khi mat Buy Box.",
+  tags: ["amazon", "sales_traffic", "mart"],
+  bigquery: { partitionBy: "report_date", clusterBy: ["sku"] }
+}
+
+/*
+  Mat Buy Box = khach VAN vao trang, nhung nut "Add to Cart" thuoc seller khac.
+  Voi hang nha ban doc quyen (AFW tu ban SKU cua minh), buy_box < 100% thuong do:
+    - Amazon Retail cung ban ASIN do
+    - Seller khac hijack listing
+    - Gia cua minh cao hon "fair price" Amazon dat ra -> Amazon TAT Buy Box
+    - Het hang -> Buy Box chuyen sang seller con hang
+
+  ⚠️ Cot buy_box_pct la % THOI GIAN giu duoc Buy Box trong ngay, khong phai % don hang.
+*/
+
+SELECT
+  report_date,
+  sku,
+  child_asin,
+
+  sessions,
+  page_views,
+  units_ordered,
+  ordered_product_sales AS revenue,
+  buy_box_pct,
+  unit_session_pct      AS cvr_pct,
+
+  -- Uoc luong don MAT do khong giu Buy Box:
+  -- gia dinh khach chi mua khi minh giu Buy Box -> phan session roi vao thoi gian
+  -- mat Buy Box coi nhu mat trang.
+  ROUND(sessions * (1 - IFNULL(buy_box_pct, 100) / 100) * (IFNULL(unit_session_pct, 0) / 100), 1)
+    AS est_units_lost_no_buybox,
+
+  ROUND(
+    sessions * (1 - IFNULL(buy_box_pct, 100) / 100)
+            * (IFNULL(unit_session_pct, 0) / 100)
+            * SAFE_DIVIDE(ordered_product_sales, NULLIF(units_ordered, 0))
+  , 2) AS est_revenue_lost_no_buybox,
+
+  CASE
+    WHEN buy_box_pct IS NULL   THEN 'UNKNOWN'
+    WHEN buy_box_pct >= 95     THEN 'OK'
+    WHEN buy_box_pct >= 80     THEN 'WATCH'
+    WHEN buy_box_pct >= 50     THEN 'DEGRADED'
+    ELSE 'LOST'
+  END AS buy_box_status
+
+FROM ${ref("master_amazon_sales_traffic_by_asin")}
+WHERE sku IS NOT NULL
+  AND report_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)

@@ -1,0 +1,191 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.mart_dataset,
+  name: "mart_amazon_traffic_conversion",
+  description: "Chan doan doanh so: giam vi IT NGUOI XEM, vi XEM MA KHONG MUA, hay vi MAT BUY BOX. Grain: sku.",
+  tags: ["amazon", "sales_traffic", "mart"],
+  bigquery: { clusterBy: ["root_cause", "sku"] }
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════════════════
+  BAO CAO NAY TRA LOI CAU HOI KHONG BAO CAO NAO KHAC TRA LOI DUOC:
+
+      "Doanh so SKU nay giam VI SAO?"
+
+  Vi phuong trinh nen tang cua ban hang tren Amazon la:
+
+      units = sessions x conversion_rate
+
+  Nen doanh so chi giam vi 3 ly do, va 3 ly do nay can 3 HANH DONG KHAC HAN:
+
+      1. sessions giam        -> IT NGUOI XEM      -> Marketing / SEO / ads
+      2. conversion_rate giam -> XEM MA KHONG MUA  -> Gia / anh / review / listing
+      3. buy_box giam         -> MAT NUT MUA       -> Gia vs doi thu / seller khac
+
+  Gop 3 thu nay lam mot ("doanh so giam") la ly do doi Sales chay lung tung.
+
+  ⚠️ LAYER INVARIANT: mart chi doc tu MASTER. Khong bao gio tu staging/raw.
+  ═══════════════════════════════════════════════════════════════════════════
+*/
+
+WITH
+-- ── Cua so hien tai: 7 ngay gan nhat ────────────────────────────────────────
+current_7d AS (
+  SELECT
+    sku,
+    ANY_VALUE(child_asin)                    AS child_asin,
+    ANY_VALUE(parent_asin)                   AS parent_asin,
+    SUM(sessions)                            AS sessions,
+    SUM(page_views)                          AS page_views,
+    SUM(units_ordered)                       AS units_ordered,
+    SUM(ordered_product_sales)               AS revenue,
+    -- CVR phai tinh lai tu tong, KHONG duoc lay AVG(unit_session_pct).
+    -- AVG cua ty le la SAI khi mau so khac nhau moi ngay.
+    SAFE_DIVIDE(SUM(units_ordered), NULLIF(SUM(sessions), 0)) * 100 AS cvr_pct,
+    -- Buy Box thi AVG hop ly hon (la ty le thoi gian, khong phai ty le count)
+    AVG(buy_box_pct)                         AS buy_box_pct,
+    COUNTIF(sessions = 0)                    AS zero_session_days
+  FROM ${ref("master_amazon_sales_traffic_by_asin")}
+  WHERE report_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                        AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND sku IS NOT NULL
+  GROUP BY sku
+),
+
+-- ── Cua so truoc do: 7 ngay lien ke ────────────────────────────────────────
+prior_7d AS (
+  SELECT
+    sku,
+    SUM(sessions)                            AS sessions,
+    SUM(units_ordered)                       AS units_ordered,
+    SUM(ordered_product_sales)               AS revenue,
+    SAFE_DIVIDE(SUM(units_ordered), NULLIF(SUM(sessions), 0)) * 100 AS cvr_pct,
+    AVG(buy_box_pct)                         AS buy_box_pct
+  FROM ${ref("master_amazon_sales_traffic_by_asin")}
+  WHERE report_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+                        AND DATE_SUB(CURRENT_DATE(), INTERVAL 8 DAY)
+    AND sku IS NOT NULL
+  GROUP BY sku
+),
+
+-- ── Ton kha dung, de tach STOCKOUT ra khoi cac nguyen nhan khac ────────────
+stock AS (
+  SELECT
+    sku,
+    SUM(available) AS available_qty
+  FROM ${ref("master_amazon_inventory_planning")}   -- cột `available` (đã verify với payload thật 2026-07-09)
+  GROUP BY sku
+),
+
+joined AS (
+  SELECT
+    c.sku,
+    c.child_asin,
+    c.parent_asin,
+
+    -- ── Traffic
+    c.sessions                                        AS sessions_7d,
+    p.sessions                                        AS sessions_prior_7d,
+    c.sessions - p.sessions                           AS d_sessions,
+    SAFE_DIVIDE(c.sessions - p.sessions, NULLIF(p.sessions, 0)) * 100 AS sessions_change_pct,
+    c.page_views                                      AS page_views_7d,
+
+    -- ── Conversion
+    c.cvr_pct                                         AS cvr_7d,
+    p.cvr_pct                                         AS cvr_prior_7d,
+    c.cvr_pct - p.cvr_pct                             AS d_cvr_pt,
+
+    -- ── Buy Box
+    c.buy_box_pct                                     AS buy_box_7d,
+    p.buy_box_pct                                     AS buy_box_prior_7d,
+    c.buy_box_pct - p.buy_box_pct                     AS d_buy_box_pt,
+
+    -- ── Ket qua
+    c.units_ordered                                   AS units_7d,
+    p.units_ordered                                   AS units_prior_7d,
+    c.units_ordered - p.units_ordered                 AS d_units,
+    c.revenue                                         AS revenue_7d,
+    c.revenue - p.revenue                             AS d_revenue,
+
+    c.zero_session_days,
+    IFNULL(s.available_qty, 0)                        AS available_qty,
+
+    /*
+      ── PHAN RA DONG GOP ─────────────────────────────────────────────────
+      units = sessions x cvr, nen:
+
+        d_units = d_sessions x cvr_prior            <- do TRAFFIC
+                + sessions_prior x d_cvr            <- do CONVERSION
+                + d_sessions x d_cvr                <- tuong tac
+
+      Cho biet trong "mat 20 don", bao nhieu don mat vi it nguoi xem,
+      bao nhieu vi khong chuyen doi. Day la con so de tranh cai voi Sales.
+    */
+    (c.sessions - p.sessions) * (p.cvr_pct / 100)                       AS units_lost_from_traffic,
+    p.sessions * ((c.cvr_pct - p.cvr_pct) / 100)                        AS units_lost_from_cvr,
+    (c.sessions - p.sessions) * ((c.cvr_pct - p.cvr_pct) / 100)         AS units_interaction
+
+  FROM current_7d c
+  LEFT JOIN prior_7d p USING (sku)
+  LEFT JOIN stock    s USING (sku)
+)
+
+SELECT
+  *,
+
+  /*
+    ── CHAN DOAN ────────────────────────────────────────────────────────────
+    Thu tu kiem tra CO Y NGHIA: nguyen nhan "cung" truoc, "mem" sau.
+    Vi neu het hang thi moi chi so khac deu vo nghia.
+  */
+  CASE
+    -- 0 sessions ca tuan trong khi tuan truoc co -> listing bien mat khoi Amazon
+    WHEN sessions_7d = 0 AND IFNULL(sessions_prior_7d, 0) > 0
+      THEN 'LISTING_DEAD'
+
+    -- Het hang: khong phai loi Sales, khong phai loi listing
+    WHEN available_qty = 0
+      THEN 'STOCKOUT'
+
+    -- Mat Buy Box: khach vao xem nhung nut "Add to Cart" thuoc ve nguoi khac
+    WHEN buy_box_7d < 70 OR d_buy_box_pt < -15
+      THEN 'BUY_BOX_LOSS'
+
+    -- Doanh so on
+    WHEN IFNULL(d_units, 0) >= 0
+      THEN 'HEALTHY'
+
+    -- Giam chu yeu do it nguoi xem
+    WHEN ABS(units_lost_from_traffic) > ABS(units_lost_from_cvr)
+      THEN 'TRAFFIC_DROP'
+
+    -- Giam chu yeu do xem ma khong mua
+    ELSE 'CONVERSION_DROP'
+  END AS root_cause,
+
+  CASE
+    WHEN sessions_7d = 0 AND IFNULL(sessions_prior_7d, 0) > 0
+      THEN 'Listing khong con hien thi. Kiem tra suppressed / inactive / het anh / vi pham policy. KHONG phai van de gia.'
+    WHEN available_qty = 0
+      THEN 'Het hang. Xem mart_channel_stockout_forecast de dieu hang cheo kho. Tat ads ngay.'
+    WHEN buy_box_7d < 70 OR d_buy_box_pt < -15
+      THEN 'Mat Buy Box. Khach VAN vao xem nhung nut mua thuoc seller khac. Kiem tra gia vs doi thu + tinh trang ton kho.'
+    WHEN IFNULL(d_units, 0) >= 0
+      THEN 'On dinh.'
+    WHEN ABS(units_lost_from_traffic) > ABS(units_lost_from_cvr)
+      THEN 'IT NGUOI XEM. Listing van chuyen doi tot. Van de o dau phieu: ads, keyword, SEO, ranking. -> Marketing.'
+    ELSE 'XEM MA KHONG MUA. Traffic van co, nhung khach khong bam mua. Van de o listing: gia, anh, review, mo ta, ship. -> Sales/Content.'
+  END AS diagnosis,
+
+  -- Muc do uu tien theo doanh thu mat
+  CASE
+    WHEN d_revenue < -1000 THEN 'P1'
+    WHEN d_revenue <  -300 THEN 'P2'
+    WHEN d_revenue <     0 THEN 'P3'
+    ELSE 'OK'
+  END AS severity,
+
+  CURRENT_TIMESTAMP() AS _generated_at
+
+FROM joined

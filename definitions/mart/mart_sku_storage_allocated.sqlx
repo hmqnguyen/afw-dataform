@@ -32,14 +32,14 @@ config {
 WITH
 -- (1) ACTUAL theo tháng sử dụng (usage) — settlement post ở m+1
 actual_by_month AS (
+  -- I1: đọc MASTER (không đọc raw). master_amazon_settlement_fees giữ đúng
+  -- grain sku-null mà stg_amazon_settlement lọc bỏ.
   SELECT
-    DATE_SUB(DATE_TRUNC(SAFE.PARSE_DATE('%Y-%m-%d',
-      JSON_VALUE(raw_payload, '$."posted-date"')), MONTH), INTERVAL 1 MONTH) AS usage_month,
-    SUM(ABS(SAFE_CAST(JSON_VALUE(raw_payload, '$.amount') AS NUMERIC)))      AS storage_actual_total
-  FROM ${ref("raw_amazon_settlement")}
+    DATE_SUB(DATE_TRUNC(posted_date, MONTH), INTERVAL 1 MONTH) AS usage_month,
+    SUM(ABS(amount))                                           AS storage_actual_total
+  FROM ${ref("master_amazon_settlement_fees")}
   WHERE brand = 'AFW'
-    AND LOWER(JSON_VALUE(raw_payload, '$."amount-description"')) LIKE '%storage%'
-    AND (JSON_VALUE(raw_payload, '$.sku') IS NULL OR JSON_VALUE(raw_payload, '$.sku') = '')
+    AND LOWER(amount_description) LIKE '%storage%'
   GROUP BY 1
   HAVING usage_month IS NOT NULL
 ),
@@ -47,7 +47,7 @@ actual_by_month AS (
 -- (2) Thể tích vật lý per-SKU (thuộc tính cố định, bản ghi mới nhất)
 sku_volume AS (
   SELECT sku, item_volume
-  FROM ${ref("stg_amazon_inventory_planning")}
+  FROM ${ref("master_amazon_inventory_planning")}
   WHERE item_volume IS NOT NULL AND item_volume > 0
   QUALIFY ROW_NUMBER() OVER (PARTITION BY sku ORDER BY snapshot_date DESC) = 1
 ),
@@ -55,7 +55,7 @@ sku_volume AS (
 -- (3) Driver: cubic-foot-days theo tháng từ Inventory Ledger (DAILY)
 daily_balance AS (
   SELECT ledger_date, msku AS sku, SUM(ending_balance) AS qty_end_of_day
-  FROM ${ref("stg_amazon_inventory_ledger")}
+  FROM ${ref("master_amazon_inventory_ledger")}
   GROUP BY 1, 2
 ),
 sku_driver AS (
