@@ -38,35 +38,20 @@ WITH parsed AS (
 
     JSON_VALUE(raw_payload, '$.parentAsin') AS parent_asin,
     JSON_VALUE(raw_payload, '$.childAsin')  AS child_asin,
-    JSON_VALUE(raw_payload, '$.sku')        AS sku_raw,   -- nguyên văn từ Amazon
-
-    -- ⚠️ CHUẨN HOÁ SKU (verify với payload thật 2026-07-11). Amazon trả SKU BẨN:
-    --     'amzn.gr.FBA-200100-5z72pSmiaS75ce-xww-VG'  → SKU Amazon tự sinh
-    --     '901060'                                    → thiếu tiền tố FBA-
-    --     'FBA- 901210' / 'FBA -815250'               → thừa dấu cách
-    -- Không chuẩn hoá → join với master_amazon_listings / fact_sku_pnl_daily ra
-    -- NULL → mart rỗng/sai MÀ KHÔNG BÁO LỖI (bẫy im lặng).
-    (
-      SELECT
-        -- 1) bóc SKU thật khỏi vỏ amzn.gr.<SKU>-<hash>
-        -- 2) bỏ MỌI khoảng trắng
-        -- 3) thêm tiền tố FBA- nếu chỉ còn phần số
-        CASE
-          WHEN core IS NULL OR core = '' THEN NULL
-          WHEN REGEXP_CONTAINS(core, r'^[0-9]+$') THEN CONCAT('FBA-', core)
-          ELSE core
-        END
-      FROM (
-        SELECT REGEXP_REPLACE(
-          COALESCE(
-            -- vỏ amzn.gr.FBA-200100-<hash> → lấy 'FBA-200100'
-            REGEXP_EXTRACT(JSON_VALUE(raw_payload, '$.sku'), r'^amzn\.[a-z]+\.(.+?)-[A-Za-z0-9]{10,}'),
-            JSON_VALUE(raw_payload, '$.sku')
-          ),
-          r'\s+', ''                       -- bỏ mọi khoảng trắng: 'FBA- 901210' → 'FBA-901210'
-        ) AS core
-      )
-    )                                       AS sku,   -- SKU đã chuẩn hoá — DÙNG CÁI NÀY để join
+    -- ⚠️ SKU GIỮ NGUYÊN VĂN — TUYỆT ĐỐI KHÔNG "chuẩn hoá".
+    --
+    -- Đã thử chuẩn hoá (bỏ dấu cách, thêm tiền tố FBA-) và ĐÓ LÀ SAI. Bằng chứng
+    -- từ master_amazon_listings (verify 2026-07-11) — 3 listing KHÁC NHAU, đều có thật:
+    --     'FBA- 901210'    (len 11, CÓ dấu cách)
+    --     '901210'         (len 6)
+    --     '901210-310010'  (len 13)
+    -- ⇒ Dấu cách trong 'FBA- 901210' KHÔNG phải lỗi nhập — nó là một phần của SKU.
+    --   Xoá dấu cách → 'FBA-901210' KHÔNG TỒN TẠI → mất join.
+    --   Thêm tiền tố cho '901210' → cũng ra SKU không tồn tại, và tệ hơn: có thể
+    --   GÁN NHẦM traffic của SKU này sang SKU khác (sai số liệu âm thầm — còn tệ
+    --   hơn để NULL).
+    -- SKU là ĐỊNH DANH: Amazon trả sao thì join đúng vậy.
+    JSON_VALUE(raw_payload, '$.sku')        AS sku,
 
     CONCAT(
       CAST(report_date AS STRING), '|',
