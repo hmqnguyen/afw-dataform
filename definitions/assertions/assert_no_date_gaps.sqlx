@@ -1,0 +1,83 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  description: "PHÁT HIỆN LỖ HỔNG NGÀY: bảng theo ngày bị thiếu ngày ở giữa (job sync lỗi/CANCELLED và bỏ qua âm thầm). Assertion FAIL nếu có ngày thiếu → pipeline dừng, không để mart tính sai trên data thủng.",
+  tags: ["assertion", "amazon", "data_quality"]
+}
+
+/*
+  VÌ SAO CẦN: các job sync thiết kế "1 ngày/chunk hỏng không giết cả job" nên
+  chúng nuốt lỗi và đi tiếp. Đã xảy ra THẬT: backfill Sales & Traffic 04-12→07-09
+  thủng 3 ngày (2026-04-16, 05-10, 07-02) mà không ai biết → mart hụt 3 ngày,
+  mọi trung bình/tổng theo tuần-tháng đều lệch.
+
+  CHỈ áp dụng cho bảng có ngày LIÊN TỤC (snapshot/report hằng ngày).
+  KHÔNG áp cho settlement / returns / orders — dữ liệu theo SỰ KIỆN, ngày không
+  phát sinh giao dịch là bình thường, không phải lỗi.
+
+  Assertion trả về CÁC DÒNG VI PHẠM (ngày thiếu). Rỗng = pass.
+*/
+
+WITH bounds AS (
+  SELECT 'stg_amazon_sales_traffic_by_date' AS table_name,
+         MIN(report_date) AS min_d, MAX(report_date) AS max_d
+  FROM ${ref("stg_amazon_sales_traffic_by_date")}
+  UNION ALL
+  SELECT 'stg_amazon_sales_traffic_by_asin',
+         MIN(report_date), MAX(report_date)
+  FROM ${ref("stg_amazon_sales_traffic_by_asin")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory_ledger',
+         MIN(ledger_date), MAX(ledger_date)
+  FROM ${ref("stg_amazon_inventory_ledger")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory',
+         MIN(snapshot_date), MAX(snapshot_date)
+  FROM ${ref("stg_amazon_inventory")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory_planning',
+         MIN(snapshot_date), MAX(snapshot_date)
+  FROM ${ref("stg_amazon_inventory_planning")}
+  UNION ALL
+  SELECT 'stg_amazon_listings',
+         MIN(snapshot_date), MAX(snapshot_date)
+  FROM ${ref("stg_amazon_listings")}
+),
+
+-- Ngày ĐÃ CÓ trong từng bảng
+actual AS (
+  SELECT 'stg_amazon_sales_traffic_by_date' AS table_name, report_date AS d
+  FROM ${ref("stg_amazon_sales_traffic_by_date")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'stg_amazon_sales_traffic_by_asin', report_date
+  FROM ${ref("stg_amazon_sales_traffic_by_asin")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'stg_amazon_inventory_ledger', ledger_date
+  FROM ${ref("stg_amazon_inventory_ledger")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'stg_amazon_inventory', snapshot_date
+  FROM ${ref("stg_amazon_inventory")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'stg_amazon_inventory_planning', snapshot_date
+  FROM ${ref("stg_amazon_inventory_planning")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'stg_amazon_listings', snapshot_date
+  FROM ${ref("stg_amazon_listings")} GROUP BY 1, 2
+),
+
+-- Toàn bộ ngày ĐÁNG LẼ phải có (từ min → max của chính bảng đó)
+expected AS (
+  SELECT b.table_name, d
+  FROM bounds b, UNNEST(GENERATE_DATE_ARRAY(b.min_d, b.max_d)) AS d
+  WHERE b.min_d IS NOT NULL
+)
+
+-- VI PHẠM = ngày nằm trong khoảng nhưng KHÔNG có dữ liệu
+SELECT
+  e.table_name,
+  e.d AS missing_date
+FROM expected e
+LEFT JOIN actual a
+  ON a.table_name = e.table_name AND a.d = e.d
+WHERE a.d IS NULL
+ORDER BY e.table_name, e.d
