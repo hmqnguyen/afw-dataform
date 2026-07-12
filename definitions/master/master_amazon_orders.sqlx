@@ -1,7 +1,11 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master orders — giữ lại TẤT CẢ order_item_id đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy (khác stg_amazon_orders). Mỗi lần chạy: order mới → INSERT, order đã có → UPDATE chỉ khi last_updated_date mới hơn bản đang lưu.",
+  assertions: {
+    uniqueKey: ["order_item_id"],
+    nonNull: ["order_item_id", "order_date"]
+  },
+  description: "Master orders — giữ lại TẤT CẢ order_item_id đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. Order mới → INSERT; order đã có → UPDATE chỉ khi last_updated_date mới hơn bản đang lưu. GIỮ MỌI order_status (I3) — lọc Cancelled ở fact, không ở đây.",
   tags: ["master", "amazon", "orders"],
   uniqueKey: ["order_item_id"],
   bigquery: {
@@ -10,71 +14,95 @@ config {
   }
 }
 
--- LƯU Ý QUAN TRỌNG (đã xác nhận thật ở master_amazon_settlement.sqlx —
--- cùng pattern incremental + self-join nên áp dụng fix tương tự để
--- phòng ngừa, kể cả khi file này đã từng chạy thành công ở dev): trong
--- vài trường hợp incremental() có thể trả về true (compile ra LEFT JOIN
--- ${self()}) NGAY CẢ KHI bảng đích chưa từng được tạo — ví dụ khi deploy
--- lần đầu ở môi trường mới (prod). pre_operations dưới đây CHỦ ĐỘNG tạo
--- bảng rỗng (đúng schema) TRƯỚC khi câu SELECT chính chạy — đảm bảo
--- ${self()} luôn trỏ tới 1 bảng tồn tại thật, bất kể môi trường nào.
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F3 FIX (2026-07-12) — pre_operations CŨ tạo bảng 32 CỘT nhưng câu SELECT
+   trả về 35 CỘT. MERGE ... WHEN NOT MATCHED THEN INSERT ROW → ném:
+       "Column purchase_order_number is not present in table ..."
+   → CHẶN CỨNG ngay lần chạy đầu.
+
+   3 cột bị thiếu trong CREATE TABLE cũ:
+       purchase_order_number  STRING   (PO khách — đơn B2B; AFW CÓ kênh B2B)
+       gift_wrap_tax          NUMERIC  (⚠️ fact_sku_pnl_daily ĐANG DÙNG để tính
+                                        tax_collected → thiếu = fact cũng chết)
+       promotion_ids          STRING   (attribution khuyến mãi)
+
+   BÀI HỌC: pre_operations CREATE TABLE là schema thủ công — nó KHÔNG tự đồng bộ
+   với câu SELECT. Mỗi lần thêm/bớt cột ở SELECT (hoặc ở staging upstream) PHẢI
+   sửa tay block này. Cùng lỗi này cũng có ở master_amazon_sales_traffic_by_date
+   (thiếu _ingested_at) — xem file đó.
+
+   LƯU Ý: stg_amazon_orders còn trả thêm cột `pending_price_missing_count`
+   (window COUNTIF). Master CỐ Ý KHÔNG lấy — fact tự tính lại bằng COUNTIF ở
+   grain của nó. Đừng thêm vào đây.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+-- LƯU Ý (đã xác nhận qua lỗi runtime ở master_amazon_settlement — cùng pattern):
+-- incremental() có thể trả về true (compile ra LEFT JOIN ${self()}) NGAY CẢ KHI
+-- bảng đích chưa từng được tạo — ví dụ khi deploy lần đầu ở môi trường mới (prod).
+-- pre_operations CHỦ ĐỘNG tạo bảng rỗng (đúng schema) TRƯỚC khi câu SELECT chính
+-- chạy — đảm bảo ${self()} luôn trỏ tới 1 bảng tồn tại thật, bất kể môi trường nào.
 pre_operations {
   CREATE TABLE IF NOT EXISTS ${self()} (
     brand                       STRING,
-    amazon_order_id              STRING,
-    merchant_order_id            STRING,
-    order_item_id                STRING,
-    purchase_date                 TIMESTAMP,
-    last_updated_date              TIMESTAMP,
-    order_date                      DATE,
-    order_status                     STRING,
-    item_status                       STRING,
-    fulfillment_channel                STRING,
-    sales_channel                       STRING,
-    order_channel                        STRING,
-    ship_service_level                    STRING,
-    product_title                          STRING,
-    sku                                     STRING,
-    asin                                    STRING,
-    quantity                                INT64,
-    currency_code                           STRING,
-    item_price                              NUMERIC,
-    item_tax                                NUMERIC,
-    shipping_price                          NUMERIC,
-    shipping_tax                            NUMERIC,
-    gift_wrap_price                         NUMERIC,
-    item_promotion_discount                 NUMERIC,
-    ship_promotion_discount                 NUMERIC,
-    net_item_revenue                        NUMERIC,
-    ship_to_state                           STRING,
-    ship_to_city                            STRING,
-    ship_to_postal_code                     STRING,
-    ship_to_country                         STRING,
-    is_business_order                       BOOL,
-    is_pending_price_missing                BOOL
+    amazon_order_id             STRING,
+    merchant_order_id           STRING,
+    purchase_order_number       STRING,    -- 🔴 F3: THIẾU trong bản cũ
+    order_item_id               STRING,
+    purchase_date               TIMESTAMP,
+    last_updated_date           TIMESTAMP,
+    order_date                  DATE,
+    order_status                STRING,
+    item_status                 STRING,
+    fulfillment_channel         STRING,
+    sales_channel               STRING,
+    order_channel               STRING,
+    ship_service_level          STRING,
+    product_title               STRING,
+    sku                         STRING,
+    asin                        STRING,
+    quantity                    INT64,
+    currency_code               STRING,
+    item_price                  NUMERIC,
+    item_tax                    NUMERIC,
+    shipping_price              NUMERIC,
+    shipping_tax                NUMERIC,
+    gift_wrap_price             NUMERIC,
+    gift_wrap_tax               NUMERIC,   -- 🔴 F3: THIẾU trong bản cũ (fact dùng!)
+    item_promotion_discount     NUMERIC,
+    ship_promotion_discount     NUMERIC,
+    promotion_ids               STRING,    -- 🔴 F3: THIẾU trong bản cũ
+    net_item_revenue            NUMERIC,
+    ship_to_state               STRING,
+    ship_to_city                STRING,
+    ship_to_postal_code         STRING,
+    ship_to_country             STRING,
+    is_business_order           BOOL,
+    is_pending_price_missing    BOOL
   )
   PARTITION BY order_date
   CLUSTER BY sku
 }
 
--- CÁCH HOẠT ĐỘNG (sau khi có pre_operations ở trên):
---   Lần đầu chạy: pre_operations tạo bảng rỗng → câu SELECT chính chạy,
---   LEFT JOIN vào bảng rỗng đó → mọi order_item_id đều "chưa có trong
---   master" → toàn bộ được INSERT.
+-- CÁCH HOẠT ĐỘNG:
+--   Lần đầu: pre_operations tạo bảng rỗng → LEFT JOIN vào bảng rỗng → mọi
+--   order_item_id đều "chưa có trong master" → toàn bộ INSERT.
 --
---   Từ lần 2 trở đi (incremental, bảng đã có data): Dataform tự generate
+--   Từ lần 2 (bảng đã có data): Dataform sinh
 --     MERGE master_amazon_orders T
 --     USING (<câu SELECT dưới đây>) S
 --     ON T.order_item_id = S.order_item_id
 --     WHEN MATCHED THEN UPDATE SET ...
 --     WHEN NOT MATCHED THEN INSERT ROW
 --
---   QUAN TRỌNG: MERGE mặc định ghi đè MỌI dòng matched, KHÔNG tự so sánh
---   "mới hơn". Để chỉ update khi last_updated_date mới hơn, lọc NGAY TỪ
---   NGUỒN (USING clause) bằng self-join — chỉ đưa vào MERGE những
---   order_item_id mà last_updated_date MỚI HƠN bản đang lưu, hoặc chưa
---   từng có trong master. Order không đổi sẽ không xuất hiện trong USING
---   clause → MERGE không động vào → giữ nguyên 100% bản cũ.
+--   MERGE mặc định ghi đè MỌI dòng matched, KHÔNG tự so sánh "mới hơn". Để chỉ
+--   update khi last_updated_date mới hơn, lọc NGAY TỪ NGUỒN (USING clause) bằng
+--   self-join. Order không đổi → không xuất hiện trong USING → MERGE không động
+--   vào → giữ nguyên 100%.
+--
+--   ⚠️ Đây là cơ chế duy nhất bắt được đơn Shipped → Cancelled (bug #1).
+--   Nó CHỈ hoạt động nếu OrdersSync incremental dùng report
+--   GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL (theo ngày CẬP NHẬT),
+--   KHÔNG phải BY_ORDER_DATE (theo ngày ĐẶT). Đừng đổi ngược lại.
 
 SELECT
   s.brand,

@@ -5,6 +5,7 @@ config {
   name: "stg_amazon_sales_traffic_by_asin",
   description: "Sales & Traffic cap SKU. Grain: report_date x sku.",
   tags: ["amazon", "sales_traffic", "staging"],
+  bigquery: { partitionBy: "report_date", clusterBy: ["sku"] },
   assertions: {
     uniqueKey: ["dedup_key"],
     nonNull: ["report_date", "dedup_key"]

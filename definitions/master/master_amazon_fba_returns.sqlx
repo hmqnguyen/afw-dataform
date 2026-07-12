@@ -1,7 +1,11 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master FBA returns — audit trail đơn vị vật lý nhận về kho (license-plate). Fact đọc bảng này (I1).",
+  assertions: {
+    uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "license_plate_number"],
+    nonNull: ["amazon_order_id", "sku"]
+  },
+  description: "Master FBA returns — audit trail đơn vị vật lý nhận về kho. Khoá (order, sku, return_date_raw, LPN) — LPN ĐƠN LẺ KHÔNG DUY NHẤT: Amazon tái sử dụng LPN (verify data thật 2026-07-12). Fact đọc bảng này (I1).",
   tags: ["master", "amazon", "fba_returns"],
   bigquery: { partitionBy: "return_date", clusterBy: ["sku"] }
 }

@@ -1,8 +1,12 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
-  uniqueKey: ["license_plate_number"],
-  description: "Staging FBA returns — parse GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA. Header lowercase-hyphen, return-date ISO 8601. Grain: 1 dòng = 1 đơn vị vật lý nhận về kho (license-plate-number). KHÔNG có refund $. Dedupe theo license_plate_number.",
+  assertions: {
+    uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "license_plate_number"],
+    nonNull: ["amazon_order_id", "sku"]
+  },
+  uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "license_plate_number"],
+  description: "Staging FBA returns — parse GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA. Header lowercase-hyphen, return-date ISO 8601. Grain: 1 dòng = 1 đơn vị vật lý nhận về kho (license-plate-number). KHÔNG có refund $. Dedupe theo (order, sku, return_date_raw, LPN) — LPN ĐƠN LẺ KHÔNG ĐỦ: Amazon tái sử dụng LPN (verify data thật). Status mutable (Unit returned to inventory → Reimbursed) → KHÔNG lọc ở staging.",
   tags: ["staging", "amazon", "fba_returns"],
   bigquery: {
     partitionBy: "return_date",
@@ -74,11 +78,23 @@ WITH parsed AS (
 ranked AS (
   SELECT
     *,
+    -- ⚠️ KHOÁ TỔ HỢP, KHÔNG dùng license_plate_number đơn lẻ.
+    --
+    -- BẰNG CHỨNG (data thật 191 dòng, 2026-07-12): Amazon TÁI SỬ DỤNG LPN.
+    --   LPN 'LPNPMDO3264518' xuất hiện 2 lần cho 2 lần trả HOÀN TOÀN KHÁC NHAU:
+    --     • order 112-4081506-0437029, return 2026-01-16
+    --     • order 113-5769761-0118652, return 2025-12-14
+    --   Dedup theo LPN đơn lẻ → GỘP NHẦM 2 lần trả → MẤT 1 dòng thật
+    --   (đúng bằng chênh lệch raw 191 → staging 190).
+    --
+    -- Khoá (order, sku, return_date_raw, LPN): 191/191 phân biệt, 0 collision.
+    -- COALESCE LPN vì có 1 dòng LPN rỗng (NULL-safe).
     ROW_NUMBER() OVER (
-      PARTITION BY COALESCE(
-        NULLIF(license_plate_number, ''),
-        CONCAT(amazon_order_id, '|', sku, '|', return_date_raw)
-      )
+      PARTITION BY
+        amazon_order_id,
+        sku,
+        return_date_raw,
+        COALESCE(NULLIF(TRIM(license_plate_number), ''), '')
       ORDER BY _ingested_at DESC
     ) AS rn
   FROM parsed

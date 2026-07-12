@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["order_item_id"],
+    nonNull: ["order_item_id", "order_date"]
+  },
   uniqueKey: ["order_item_id"],
   description: "Staging orders — parse JSON từ raw + dedupe theo order_item_id, gộp trong 1 bước. Không lưu raw_payload/metadata.",
   tags: ["staging", "amazon", "orders"],
@@ -104,9 +108,20 @@ WITH parsed AS (
     -- ở pre_operations) thay vì subquery inline → BigQuery coi là hằng số
     -- nên PRUNE được partition của raw (subquery inline sẽ full-scan).
     AND _ingested_at > ingested_at_checkpoint
-    -- Amazon all-orders flat file spell 'Cancelled' (2 L); vài report/locale
-    -- khác lại 'Canceled' (1 L) → lọc CẢ HAI để không lọt đơn huỷ.
-    AND JSON_VALUE(raw_payload, '$."order-status"') NOT IN ('Cancelled', 'Canceled')
+    -- ⚠️ KHÔNG LỌC 'Cancelled' Ở ĐÂY — đây từng là BUG NGHIÊM TRỌNG.
+    --
+    -- Kịch bản hỏng: đơn A hôm nay 'Shipped' → vào staging. Ngày mai A bị HUỶ →
+    -- raw có dòng A mới với status='Cancelled' → nếu staging lọc bỏ dòng đó thì
+    -- MERGE KHÔNG CÓ GÌ để cập nhật → A ở staging/master MÃI MÃI là 'Shipped'
+    -- → doanh thu bị THỔI PHỒNG vĩnh viễn, không ai phát hiện.
+    --
+    -- ⇒ Staging giữ MỌI trạng thái (order_status là cột dữ liệu, không phải
+    --   bộ lọc). MERGE theo order_item_id sẽ ghi đè bản cũ bằng bản mới nhất
+    --   (Shipped → Cancelled). Việc LOẠI đơn huỷ khỏi doanh thu làm ở tầng
+    --   FACT/MART (nơi tính tiền), không phải ở staging (nơi phản ánh sự thật).
+    --
+    -- Lưu ý chính tả: Amazon all-orders flat file dùng 'Cancelled' (2 chữ L);
+    -- vài report/locale khác dùng 'Canceled' (1 L) → downstream lọc CẢ HAI.
 ),
 
 ranked AS (

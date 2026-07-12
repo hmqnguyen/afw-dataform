@@ -1,20 +1,20 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
+    nonNull: ["amazon_order_id", "sku"]
+  },
   uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
-  description: "Staging returns (FBM/MFN) — parse GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE. Field name là Title-Case-có-dấu-cách ('Order ID','Merchant SKU'...), ngày dạng DD-Mon-YYYY. Dedupe theo (order, sku, return_date_raw, rma_id).",
+  description: "Staging returns (FBM/MFN) — GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE. VERIFIED với 519 dòng thật (2026-07-12): map ĐỦ 33 cột gồm SafeT reimbursement + A-to-Z claim (TIỀN THẬT, trước đây bị bỏ sót). Dedup key (order, sku, return_date_raw, rma_id) — 519/519 phân biệt, 0 collision.",
   tags: ["staging", "amazon", "returns"],
   bigquery: {
     partitionBy: "return_date",
     clusterBy: ["sku"]
   }
-
 }
 
 pre_operations {
-  -- Checkpoint watermark. Lần chạy ĐẦU / --full-refresh: Dataform bỏ qua
-  -- nhánh incremental() → checkpoint = 1970 → nạp TOÀN BỘ raw (build lại từ
-  -- đầu). Các lần sau: checkpoint = _ingested_at lớn nhất đã xử lý.
   DECLARE ingested_at_checkpoint DEFAULT (
     ${when(incremental(),
       `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
@@ -22,96 +22,113 @@ pre_operations {
   )
 }
 
+/*
+  ⚠️ 3 CẠM BẪY ĐÃ VERIFY VỚI DATA THẬT (519 dòng, 2026-07-12):
 
--- INCREMENTAL + WATERMARK trên _ingested_at:
---   • Chạy thường: CHỈ quét raw MỚI (_ingested_at > watermark) → không quét lại
---     toàn bộ lịch sử raw (raw append-only, phình dần theo thời gian).
---   • Dedup 2 tầng: (a) ROW_NUMBER khử trùng TRONG batch mới; (b) Dataform MERGE
---     theo uniqueKey khử trùng XUYÊN batch — bản mới ghi đè bản cũ (latest-wins
---     giữ nguyên, vì raw mới luôn có _ingested_at lớn hơn).
---   • Sửa logic staging / nạp raw cũ (backfill) → chạy `dataform run --full-refresh`
---     (bỏ qua watermark, rebuild toàn bộ). Chunk chồng biên vẫn an toàn nhờ MERGE.
+  1. Ô RỖNG LÀ ' ' (DẤU CÁCH), KHÔNG PHẢI ''.
+     'Merchant RMA ID', 'Invoice number', 'SafeT claim id'... đều = ' ' ở 519/519
+     dòng. ⇒ NULLIF(x, '') KHÔNG bắt được → phải dùng NULLIF(TRIM(x), '').
+     Nếu không: fallback rma_id lấy nhầm ' ' thay vì NULL; cột string lưu dấu cách.
 
--- LƯU Ý (đã verify bằng data thật): report này KHÁC hẳn quy ước lowercase-
--- hyphen của Orders/Settlement — header là "Order ID", "Merchant SKU",
--- "Return request date"... JSON key phải khớp CHÍNH XÁC (JSON_VALUE
--- case-sensitive). Ngày là "18-May-2026" → PARSE_DATE('%d-%b-%Y'), KHÔNG
--- dùng SAFE_CAST AS TIMESTAMP (sẽ ra NULL).
+  2. TRẠNG THÁI THAY ĐỔI ĐƯỢC — KHÔNG lọc ở staging.
+     Return request status: Approved 510 / PendingApproval 7 / Closed 2.
+     Resolution: StandardRefund / AutomatedRefund / RefundAtFirstScan / Replacement.
+     7 dòng PendingApproval SẼ đổi trạng thái sau → MERGE phải cập nhật được.
+     (Cùng lớp bug với orders: đừng bao giờ lọc theo trạng thái ở staging.)
+     ⇒ ReturnsSync lookback 60 ngày để kéo lại đơn đã đổi trạng thái.
+
+  3. TIỀN BỊ BỎ SÓT (bản cũ chỉ map 15/33 cột):
+     • SafeT claim reimbursement — Amazon BỒI HOÀN cho seller khi hàng trả về
+       bị hỏng/mất. TIỀN VÀO, thiếu hoàn toàn khỏi P&L.
+     • A-to-Z Claim — khiếu nại của khách. TIỀN RA.
+     • Label cost / Label to be paid by — ai trả phí nhãn trả hàng.
+     Hiện SafeT = ' ' ở 519/519 (chưa có claim), nhưng khi phát sinh phải thấy được.
+
+  Ngày dạng "18-May-2026" → PARSE_DATE('%d-%b-%Y'). Field name Title-Case
+  có dấu cách, CASE-SENSITIVE.
+*/
+
 WITH parsed AS (
   SELECT
     brand,
 
-    JSON_VALUE(raw_payload, '$."Order ID"')                  AS amazon_order_id,
-    JSON_VALUE(raw_payload, '$."Order Item ID"')             AS order_item_id,
-    -- Ưu tiên Amazon RMA ID; Merchant RMA ID thường rỗng
+    -- ── Định danh ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Order ID"')), '')                AS amazon_order_id,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Order Item ID"')), '')           AS order_item_id,
+    -- rma_id: Amazon RMA trước, fallback Merchant RMA. TRIM vì ô rỗng là ' '.
     COALESCE(
-      NULLIF(JSON_VALUE(raw_payload, '$."Amazon RMA ID"'), ''),
-      NULLIF(JSON_VALUE(raw_payload, '$."Merchant RMA ID"'), '')
-    )                                                         AS rma_id,
+      NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Amazon RMA ID"')), ''),
+      NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Merchant RMA ID"')), '')
+    )                                                                        AS rma_id,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Merchant SKU"')), '')            AS sku,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."ASIN"')), '')                    AS asin,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Item Name"')), '')               AS item_name,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Invoice number"')), '')          AS invoice_number,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Tracking ID"')), '')             AS tracking_id,
 
-    JSON_VALUE(raw_payload, '$."Merchant SKU"')              AS sku,
-    JSON_VALUE(raw_payload, '$."ASIN"')                      AS asin,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."Return quantity"') AS INT64) AS quantity,
-
-    JSON_VALUE(raw_payload, '$."Return request date"')       AS return_date_raw,
-    TIMESTAMP(SAFE.PARSE_DATE('%d-%b-%Y',
-      JSON_VALUE(raw_payload, '$."Return request date"')))    AS return_timestamp,
+    -- ── Ngày ──
+    -- return_date_raw giữ NGUYÊN VĂN vì nó nằm trong dedup key.
+    JSON_VALUE(raw_payload, '$."Return request date"')                       AS return_date_raw,
     SAFE.PARSE_DATE('%d-%b-%Y',
-      JSON_VALUE(raw_payload, '$."Return request date"'))     AS return_date,
+      TRIM(JSON_VALUE(raw_payload, '$."Return request date"')))              AS return_date,
+    -- timestamp = return_date lúc 00:00 UTC (report chỉ có NGÀY, không có giờ)
+    TIMESTAMP(SAFE.PARSE_DATE('%d-%b-%Y',
+      TRIM(JSON_VALUE(raw_payload, '$."Return request date"'))))             AS return_timestamp,
+    SAFE.PARSE_DATE('%d-%b-%Y',
+      TRIM(JSON_VALUE(raw_payload, '$."Order date"')))                       AS order_date,
+    SAFE.PARSE_DATE('%d-%b-%Y',
+      TRIM(JSON_VALUE(raw_payload, '$."Return delivery date"')))             AS return_delivery_date,
 
-    JSON_VALUE(raw_payload, '$."Return Reason"')             AS return_reason,
-    JSON_VALUE(raw_payload, '$."Return request status"')     AS return_status,   -- Approved/Declined...
-    JSON_VALUE(raw_payload, '$."Resolution"')                AS resolution,      -- StandardRefund/AutomatedRefund/RefundAtFirstScan
-    JSON_VALUE(raw_payload, '$."Return type"')               AS return_type,     -- C-Returns
+    -- ── Số lượng ──
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."Return quantity"')) AS INT64) AS quantity,
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."Order quantity"')) AS INT64)  AS order_quantity,
 
-    -- FBM report KHÔNG có fulfillment-center-id (đó là field của FBA report)
-    CAST(NULL AS STRING)                                     AS fulfillment_center_id,
-    JSON_VALUE(raw_payload, '$."Label type"')                AS label_type,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."Label cost"') AS NUMERIC)      AS label_cost,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."Refunded Amount"') AS NUMERIC) AS refunded_amount,  -- refund $ thực tế
+    -- ── Trạng thái (THAY ĐỔI ĐƯỢC — dữ liệu, không phải bộ lọc) ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Return request status"')), '')   AS return_status,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Resolution"')), '')              AS resolution,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Return Reason"')), '')           AS return_reason,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Return type"')), '')             AS return_type,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."In policy"')), '')               AS in_policy,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Is prime"')), '')                AS is_prime,
+
+    -- ── Vận chuyển trả hàng ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Return carrier"')), '')          AS return_carrier,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Label type"')), '')              AS label_type,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Label to be paid by"')), '')     AS label_paid_by,
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."Label cost"')) AS NUMERIC)    AS label_cost,
+
+    -- ── TIỀN ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."Currency code"')), '')           AS currency_code,
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."Order Amount"')) AS NUMERIC)  AS order_amount,
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."Refunded Amount"')) AS NUMERIC) AS refunded_amount,
+
+    -- ── SafeT claim: Amazon BỒI HOÀN seller (TIỀN VÀO) ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."SafeT claim id"')), '')          AS safet_claim_id,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."SafeT claim state"')), '')       AS safet_claim_state,
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."SafeT Action reason"')), '')     AS safet_action_reason,
+    SAFE_CAST(TRIM(JSON_VALUE(raw_payload, '$."SafeT claim reimbursement amount"')) AS NUMERIC)
+                                                                             AS safet_reimbursement_amount,
+    SAFE_CAST(NULLIF(TRIM(JSON_VALUE(raw_payload, '$."SafeT claim creation time"')), '') AS TIMESTAMP)
+                                                                             AS safet_claim_created_at,
+
+    -- ── A-to-Z claim: khiếu nại của khách (TIỀN RA) ──
+    NULLIF(TRIM(JSON_VALUE(raw_payload, '$."A-to-Z Claim"')), '')            AS a_to_z_claim,
 
     _ingested_at
-
   FROM ${ref("raw_amazon_returns")}
   WHERE brand = 'AFW'
-    -- watermark: chỉ lấy raw MỚI kể từ lần chạy trước. Dùng BIẾN (khai báo
-    -- ở pre_operations) thay vì subquery inline → BigQuery coi là hằng số
-    -- nên PRUNE được partition của raw (subquery inline sẽ full-scan).
     AND _ingested_at > ingested_at_checkpoint
 ),
 
 ranked AS (
-  SELECT
-    *,
+  SELECT *,
     ROW_NUMBER() OVER (
       PARTITION BY amazon_order_id, sku, return_date_raw, COALESCE(rma_id, '')
       ORDER BY _ingested_at DESC
     ) AS rn
   FROM parsed
-  WHERE sku IS NOT NULL AND sku != ''
+  WHERE amazon_order_id IS NOT NULL
+    AND sku IS NOT NULL
 )
 
-SELECT
-  brand,
-  amazon_order_id,
-  order_item_id,
-  rma_id,
-  sku,
-  asin,
-  quantity,
-  return_date_raw,
-  return_timestamp,
-  return_date,
-  return_reason,
-  return_status,
-  resolution,
-  return_type,
-  fulfillment_center_id,
-  label_type,
-  label_cost,
-  refunded_amount,
-  -- Giữ _ingested_at để master_amazon_returns so sánh "mới hơn"
-  -- (return_status/resolution có thể đổi theo thời gian xử lý).
-  _ingested_at
-FROM ranked
-WHERE rn = 1
+SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1

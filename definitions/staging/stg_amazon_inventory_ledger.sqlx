@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["ledger_date", "msku", "fnsku", "disposition", "location"],
+    nonNull: ["ledger_date", "msku"]
+  },
   uniqueKey: ["ledger_date", "msku", "fnsku", "disposition", "location"],
   description: "Staging Inventory Ledger Summary (DAILY, per FNSKU/MSKU/Disposition) — số lượng tồn theo ngày chuẩn audit. VERIFIED với data thật 2026-07-09 (report là QUOTED TSV — TsvParser tự strip ngoặc). Date dạng MM/DD/YYYY.",
   tags: ["staging", "amazon", "inventory_ledger"],
@@ -16,6 +20,35 @@ pre_operations {
     ${when(incremental(),
       `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
       `SELECT TIMESTAMP('1970-01-01')`)}
+
+/*
+  ⚠️ ĐẲNG THỨC SỔ CÁI (verify 4,763 dòng thật, 2026-07-12 — 0 lệch):
+
+    ending_balance = starting_balance
+                   + receipts + customer_returns + customer_shipments + vendor_returns
+                   + warehouse_transfer_in_out + found + lost + damaged + disposed
+                   + other_events + unknown_events
+
+  ⚠️ 'in_transit_between_warehouses' KHÔNG nằm trong đẳng thức này.
+     Nó là cột GHI CHÚ (hàng đang trên đường giữa các kho — CHƯA nằm trong tồn
+     kho của warehouse nào). Cộng nó vào → 406/4,763 dòng LỆCH.
+     ⇒ ĐỪNG cộng in_transit vào balance, và ĐỪNG tính nó vào phí lưu kho
+       (hàng trên đường không bị tính phí storage).
+
+  ⚠️ AMAZON ĐÃ KÝ SẴN DẤU — KHÔNG được tự đảo dấu:
+     customer_shipments : LUÔN ÂM (681 âm / 0 dương)
+     vendor_returns     : LUÔN ÂM
+     lost               : ÂM
+     customer_returns   : LUÔN DƯƠNG
+     receipts           : chủ yếu DƯƠNG (có 11 dòng âm — điều chỉnh)
+     ⇒ Chỉ việc CỘNG tất cả, không nhân -1.
+
+  Disposition thực tế: SELLABLE 4,025 · CUSTOMER_DAMAGED 708 · DEFECTIVE 28 · WAREHOUSE_DAMAGED 2
+  ⇒ mart_sku_storage_allocated CỐ Ý cộng MỌI disposition — hàng hỏng vẫn chiếm
+    chỗ trong kho nên vẫn phát sinh phí lưu kho.
+
+  Location = 'US' (1 giá trị) · Store = '' (rỗng toàn bộ) → không dùng làm cluster key.
+*/
   )
 }
 

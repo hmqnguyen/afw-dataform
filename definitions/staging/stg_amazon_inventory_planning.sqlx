@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["snapshot_date", "sku", "condition"],
+    nonNull: ["snapshot_date", "sku"]
+  },
   uniqueKey: ["snapshot_date", "sku", "condition"],
   description: "Staging FBA Inventory Planning (per-SKU snapshot) — verified với data thật 2026-07-09. Tồn theo tuổi, days-of-supply, sell-through, thể tích/storage per-SKU (driver phân bổ), health + recommendation.",
   tags: ["staging", "amazon", "inventory_planning"],

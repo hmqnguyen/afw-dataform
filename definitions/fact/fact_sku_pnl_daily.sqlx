@@ -1,7 +1,7 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.fact_dataset,
-  description: "Fact P&L by SKU daily — MERGE từ 3 nguồn (Orders, Settlement, Returns). Grain: brand × channel × sku × day. Ads TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily) — xem README để biết cách JOIN cross-project nếu cần P&L có Ads. Chưa có COGS và Cost Allocation Engine.",
+  description: "Fact P&L by SKU daily — MERGE từ 3 nguồn (Orders, Settlement, Returns). Grain: brand × channel × sku × day. Ads TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily). Chưa có COGS và Cost Allocation Engine. F4 fix 2026-07-12: DECLARE chuyển vào pre_operations + gộp 2 mệnh đề WHERE trùng.",
   tags: ["fact", "amazon", "sku_pnl"],
   uniqueKey: ["brand", "channel", "sku", "day"],
   bigquery: {
@@ -11,15 +11,42 @@ config {
   }
 }
 
--- lookback 35 ngày để bắt kịp settlement post trễ + buffer nếu job fail vài ngày
---
--- LƯU Ý: Ads (ad_spend, ad_impressions, ad_clicks, ad_attributed_*) đã
--- TÁCH RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily),
--- vì AdsSync (C#) cũng tách thành solution riêng. Bảng này KHÔNG còn
--- ad_agg CTE — nếu cần P&L có Ads, JOIN cross-project thủ công (xem
--- README của AfwAdsDataform).
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F4 — DECLARE nằm SAI CHỖ (bản cũ)
 
-DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY);
+   Bản cũ đặt `DECLARE target_date_start ...;` thẳng trong BODY của SQLX,
+   ngay sau block config. Dataform bọc body vào:
+       MERGE fact_sku_pnl_daily T USING ( <BODY> ) S ON ...
+   → `DECLARE` bên trong subquery = SYNTAX ERROR. Không compile được.
+   (Full-refresh cũng hỏng: CREATE OR REPLACE TABLE t AS (DECLARE...; WITH...)
+    cũng không hợp lệ.)
+   → Mọi DECLARE phải nằm trong `pre_operations` — đúng như 12 staging đang làm.
+
+   🔴 F4b — HAI mệnh đề WHERE liên tiếp (bản cũ)
+
+       FROM combined
+       WHERE sku IS NOT NULL AND day IS NOT NULL       ← WHERE #1
+       ${ when(incremental(), `WHERE day >= ...` ) }    ← WHERE #2  💥
+
+   Lần chạy incremental sinh ra 2 WHERE liền nhau → SYNTAX ERROR.
+   → Gộp thành 1 WHERE, nhánh incremental nối bằng AND.
+   (Thực ra bộ lọc 35 ngày đã có ở target_date_start trên TỪNG CTE nguồn rồi
+    — nhánh này chỉ còn là hàng rào an toàn; vẫn giữ nhưng viết đúng cú pháp.)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+pre_operations {
+  -- Lookback 35 ngày: bắt kịp settlement post trễ + buffer nếu job fail vài ngày.
+  -- ⚠️ RÀNG BUỘC CỨNG với I2: raw retention = 90 ngày phải LỚN HƠN cửa sổ này.
+  --    Đừng nới 35 ngày lên gần 90 mà không nới retention raw trước.
+  DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+}
+
+-- LƯU Ý: Ads (ad_spend, ad_impressions, ad_clicks, ad_attributed_*) đã TÁCH
+-- RIÊNG sang project AfwAdsDataform (fact_ads_performance_daily), vì AdsSync (C#)
+-- cũng tách thành solution riêng. Bảng này KHÔNG còn ad_agg CTE — nếu cần P&L
+-- có Ads, JOIN cross-project thủ công (xem README của AfwAdsDataform).
+-- ⚠️ Ad spend ăn ~79% CM1 kênh Amazon → mọi báo cáo đọc bảng NÀY MÀ KHÔNG JOIN
+--    Ads đều THỔI PHỒNG lợi nhuận kênh. Ghi rõ caveat này ở mọi mart downstream.
 
 WITH revenue_agg AS (
   SELECT
@@ -38,6 +65,13 @@ WITH revenue_agg AS (
     COUNTIF(is_pending_price_missing)                                    AS pending_price_missing_count
   FROM ${ref("master_amazon_orders")}
   WHERE order_date >= target_date_start
+    -- ⚠️ LỌC ĐƠN HUỶ Ở ĐÂY (tầng tính tiền), KHÔNG ở staging (I3).
+    -- Staging/master GIỮ mọi trạng thái để MERGE cập nhật được khi đơn đổi
+    -- Shipped → Cancelled. Nếu lọc ở staging, dòng huỷ không bao giờ vào →
+    -- master mãi mãi giữ trạng thái cũ → doanh thu thổi phồng vĩnh viễn (bug #1).
+    -- Chính tả: 'Cancelled' (2 L) ở all-orders flat file; 'Canceled' (1 L) ở
+    -- vài report/locale khác → lọc CẢ HAI.
+    AND order_status NOT IN ('Cancelled', 'Canceled')
   GROUP BY brand, sku, order_date
 ),
 
@@ -49,13 +83,20 @@ fees_agg AS (
     posted_date  AS day,
     SUM(IF(amount_description = 'Commission', amount, 0))                AS commission_fee,
     SUM(IF(amount_description LIKE 'FBA%Fulfillment%', amount, 0))       AS fba_fulfillment_fee,
+    -- 🔴 F9 — CỘT NÀY LUÔN = 0. GIỮ LẠI CÓ CHỦ Ý (làm chứng + bắt lỗi tương lai).
+    -- Bảng này đọc master_amazon_settlement = CHỈ dòng có SKU. Verify data thật
+    -- (12,272 raw → 11,762 staging): 100% phí storage nằm ở 493 dòng `sku IS NULL`
+    -- → chúng đi vào master_amazon_settlement_fees, KHÔNG vào đây.
+    -- ⇒ Nếu cột này khác 0 → Amazon ĐÃ ĐỔI cách post phí storage → phải rà lại
+    --   mart_sku_storage_allocated (nó đang giả định storage là account-level).
+    --   Kiểm tra: SELECT SUM(storage_fee) FROM fact_sku_pnl_daily;  -- kỳ vọng 0
     SUM(IF(amount_description LIKE '%Storage%', amount, 0))              AS storage_fee,
     SUM(IF(amount_description LIKE '%Refund%'
-      OR transaction_type = 'Refund', amount, 0))                       AS refund_amount,
-    -- other_fees: CHỈ các dòng phí thật (amount_type='ItemFees') chưa được
-    -- gom ở trên. TRÁNH gộp Principal/Tax/WithheldTax/Promotion (ItemPrice/
-    -- ItemWithheldTax/Promotion) — đó là doanh thu/thuế pass-through, KHÔNG
-    -- phải phí. Trước đây catch-all khiến other_fees ≈ Principal (sai nghĩa).
+      OR transaction_type = 'Refund', amount, 0))                        AS refund_amount,
+    -- other_fees: CHỈ các dòng phí thật (amount_type='ItemFees') chưa gom ở trên.
+    -- TRÁNH gộp Principal/Tax/WithheldTax/Promotion (ItemPrice/ItemWithheldTax/
+    -- Promotion) — đó là doanh thu/thuế pass-through, KHÔNG phải phí. Trước đây
+    -- catch-all khiến other_fees ≈ Principal (sai nghĩa).
     SUM(IF(
       amount_type = 'ItemFees'
       AND amount_description NOT IN ('Commission')
@@ -78,12 +119,12 @@ returns_agg AS (
     day,
     SUM(units_returned) AS units_returned
   FROM (
-    -- FBM/MFN returns (có refund $, RMA) — stg_amazon_returns
+    -- FBM/MFN returns (có refund $, RMA) — master_amazon_returns
     SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
     FROM ${ref("master_amazon_returns")}
     WHERE return_date >= target_date_start
     UNION ALL
-    -- FBA returns (đơn vị vật lý nhận về kho) — stg_amazon_fba_returns.
+    -- FBA returns (đơn vị vật lý nhận về kho) — master_amazon_fba_returns.
     -- Population TÁCH BIỆT với FBM (đơn FBA không có trong report FBM) →
     -- union không double-count.
     SELECT brand, sku, return_date AS day, COALESCE(quantity, 0) AS units_returned
@@ -93,10 +134,35 @@ returns_agg AS (
   GROUP BY brand, sku, day
 ),
 
+-- ── TIỀN từ returns FBM (trước đây BỊ BỎ SÓT hoàn toàn — bug #4) ──
+-- Report returns chứa 3 khoản tiền mà settlement KHÔNG phản ánh theo SKU:
+--   • safet_reimbursement_amount — Amazon BỒI HOÀN seller khi hàng trả về bị
+--     hỏng/mất trong quá trình FBM. TIỀN VÀO (dấu +).
+--   • label_cost — phí nhãn trả hàng. TIỀN RA, CHỈ tính khi SELLER trả
+--     (label_paid_by). Data thật: Seller 311 / Customer 208 → trước đây tính
+--     cho cả 208 ca khách tự trả = sai chi phí.
+--   • a_to_z_claim — khiếu nại A-to-Z. Cờ theo dõi (số tiền nằm ở settlement).
+returns_money AS (
+  SELECT
+    brand,
+    sku,
+    return_date AS day,
+    SUM(COALESCE(safet_reimbursement_amount, 0))                    AS safet_reimbursement,
+    SUM(IF(LOWER(COALESCE(label_paid_by, '')) LIKE '%seller%'
+           OR LOWER(COALESCE(label_paid_by, '')) LIKE '%merchant%',
+           COALESCE(label_cost, 0), 0))                             AS return_label_cost,
+    COUNTIF(safet_claim_id IS NOT NULL)                             AS safet_claim_count,
+    COUNTIF(a_to_z_claim IS NOT NULL
+            AND LOWER(a_to_z_claim) NOT IN ('n', 'no', 'false'))    AS a_to_z_claim_count
+  FROM ${ref("master_amazon_returns")}
+  WHERE return_date >= target_date_start
+  GROUP BY brand, sku, day
+),
+
 combined AS (
   SELECT
-    COALESCE(r.brand, f.brand, rt.brand)         AS brand,
-    COALESCE(r.channel, f.channel, rt.channel)   AS channel,
+    COALESCE(r.brand, f.brand, rt.brand)          AS brand,
+    COALESCE(r.channel, f.channel, rt.channel)    AS channel,
     COALESCE(r.sku, f.sku, rt.sku)                AS sku,
     COALESCE(r.day, f.day, rt.day)                AS day,
     r.units_sold,
@@ -113,12 +179,20 @@ combined AS (
     f.refund_amount,
     f.other_fees,
     f.total_settlement_amount,
-    rt.units_returned
+    rt.units_returned,
+    rm.safet_reimbursement,
+    rm.return_label_cost,
+    rm.safet_claim_count,
+    rm.a_to_z_claim_count
   FROM revenue_agg r
-  FULL OUTER JOIN fees_agg   f  ON r.brand = f.brand  AND r.sku = f.sku  AND r.day = f.day
+  FULL OUTER JOIN fees_agg    f  ON r.brand = f.brand AND r.sku = f.sku AND r.day = f.day
   FULL OUTER JOIN returns_agg rt ON COALESCE(r.brand, f.brand) = rt.brand
-                                 AND COALESCE(r.sku, f.sku) = rt.sku
-                                 AND COALESCE(r.day, f.day) = rt.day
+                                 AND COALESCE(r.sku, f.sku)    = rt.sku
+                                 AND COALESCE(r.day, f.day)    = rt.day
+  -- Tiền từ returns (SafeT bồi hoàn, phí nhãn) — trước đây bỏ sót hoàn toàn.
+  LEFT JOIN returns_money rm ON COALESCE(r.brand, f.brand, rt.brand) = rm.brand
+                             AND COALESCE(r.sku, f.sku, rt.sku)      = rm.sku
+                             AND COALESCE(r.day, f.day, rt.day)      = rm.day
 )
 
 SELECT
@@ -126,34 +200,70 @@ SELECT
   channel,
   sku,
   day,
-  COALESCE(units_sold, 0)                AS units_sold,
-  COALESCE(gross_revenue, 0)             AS gross_revenue,
-  COALESCE(shipping_revenue, 0)          AS shipping_revenue,
-  COALESCE(tax_collected, 0)             AS tax_collected,
-  COALESCE(promotion_discount, 0)        AS promotion_discount,
-  COALESCE(fba_item_count, 0)            AS fba_item_count,
-  COALESCE(fbm_item_count, 0)            AS fbm_item_count,
+  COALESCE(units_sold, 0)                  AS units_sold,
+  COALESCE(gross_revenue, 0)               AS gross_revenue,
+  COALESCE(shipping_revenue, 0)            AS shipping_revenue,
+  COALESCE(tax_collected, 0)               AS tax_collected,
+  COALESCE(promotion_discount, 0)          AS promotion_discount,
+  COALESCE(fba_item_count, 0)              AS fba_item_count,
+  COALESCE(fbm_item_count, 0)              AS fbm_item_count,
   COALESCE(pending_price_missing_count, 0) AS pending_price_missing_count,
-  COALESCE(commission_fee, 0)            AS commission_fee,
-  COALESCE(fba_fulfillment_fee, 0)       AS fba_fulfillment_fee,
-  COALESCE(storage_fee, 0)               AS storage_fee,
-  COALESCE(refund_amount, 0)             AS refund_amount,
-  COALESCE(other_fees, 0)                AS other_fees,
-  COALESCE(total_settlement_amount, 0)   AS total_settlement_amount,
-  COALESCE(units_returned, 0)            AS units_returned,
-  -- channel_contribution_margin_pre_cogs: CHƯA trừ COGS (Nhà Máy 5),
-  -- CHƯA trừ ad_spend (Ads tách sang AfwAdsDataform), và CỐ Ý KHÔNG trừ
-  -- refund — margin ở đây là PRE-REFUND (quyết định nghiệp vụ; hoàn hàng
-  -- xử lý ở bước P&L sau). Lưu ý caveat: dòng commission được hoàn lại
-  -- (transaction_type='Refund', amount dương) vẫn rơi vào commission_fee
-  -- của NGÀY refund → margin ngày đó có phần dương nhỏ. Chấp nhận theo
-  -- góc nhìn dòng tiền theo ngày; tách nếu sau này cần margin theo đơn.
-  (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
-    - COALESCE(commission_fee, 0) * -1
-    - COALESCE(fba_fulfillment_fee, 0) * -1
-    - COALESCE(storage_fee, 0) * -1)     AS channel_contribution_margin_pre_cogs,
-  CURRENT_TIMESTAMP()                    AS _transformed_at
-FROM combined
-WHERE sku IS NOT NULL AND day IS NOT NULL
+  COALESCE(commission_fee, 0)              AS commission_fee,
+  COALESCE(fba_fulfillment_fee, 0)         AS fba_fulfillment_fee,
+  COALESCE(storage_fee, 0)                 AS storage_fee,
+  COALESCE(refund_amount, 0)               AS refund_amount,
+  COALESCE(other_fees, 0)                  AS other_fees,
+  COALESCE(total_settlement_amount, 0)     AS total_settlement_amount,
+  COALESCE(units_returned, 0)              AS units_returned,
+  -- Tiền từ returns FBM (trước đây BỎ SÓT):
+  COALESCE(safet_reimbursement, 0)         AS safet_reimbursement,   -- Amazon bồi hoàn seller (+)
+  COALESCE(return_label_cost, 0)           AS return_label_cost,     -- phí nhãn seller chịu (−)
+  COALESCE(safet_claim_count, 0)           AS safet_claim_count,
+  COALESCE(a_to_z_claim_count, 0)          AS a_to_z_claim_count,
 
-${ when(incremental(), `WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)`) }
+  /* ═══════════════════════════════════════════════════════════════════════
+     🔴 F9 (2026-07-12) — TÊN CŨ `channel_contribution_margin_pre_cogs` LÀ MỘT
+     LỜI NÓI DỐI. Nó gợi ý "chỉ còn thiếu COGS", trong khi thực tế thiếu:
+
+       • AD SPEND    — −$104,679 (settlement_fees, cost_group='MARKETING')
+                       Ăn ~79% CM1. Kênh chỉ lãi nhờ ORGANIC; phần trả phí ÂM RÒNG.
+       • STORAGE     — công thức cũ TRỪ `storage_fee`, nhưng cột đó LUÔN = 0
+                       (xem chú thích ở fees_agg) → chưa trừ đồng nào.
+       • FREIGHT/DUTY— cước nhập ~$14K (settlement_fees, cost_group='LOGISTICS')
+       • COGS        — Nhà Máy 5, chưa có nguồn.
+
+     ⇒ Đổi tên thành `..._pre_cogs_pre_ads_pre_storage` để KHÔNG AI đọc nhầm.
+       Ba khoản trên đều là CẤP TÀI KHOẢN (0 dòng có SKU) → KHÔNG bịa phân bổ
+       xuống SKU ở đây. Chúng được tổng hợp ở `mart_amazon_channel_pnl_monthly`
+       (grain: tháng × kênh) — nơi con số là SỰ THẬT, không phải giả định.
+
+       Storage CÓ driver vật lý chính đáng (cubic-foot-days) → xem
+       `mart_sku_storage_allocated`. Ads thì KHÔNG có driver nào ở cấp SKU cho
+       tới khi nối Advertising API.
+
+     Về dấu: settlement trả PHÍ dưới dạng SỐ ÂM. `- x * -1` = `+ x`, với x âm
+     ⇒ trừ đúng. Viết vòng nhưng ĐÚNG — đừng "đơn giản hoá" thành `- x`, sẽ
+     CỘNG THÊM phí vào margin.
+
+     CỐ Ý KHÔNG trừ refund — margin ở đây là PRE-REFUND (quyết định nghiệp vụ).
+     Caveat: dòng commission được hoàn lại (transaction_type='Refund', amount
+     dương) vẫn rơi vào commission_fee của NGÀY refund → margin ngày đó có phần
+     dương nhỏ. Chấp nhận theo góc nhìn dòng tiền theo ngày.
+     ═══════════════════════════════════════════════════════════════════════ */
+  (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
+    - COALESCE(commission_fee, 0)      * -1
+    - COALESCE(fba_fulfillment_fee, 0) * -1
+    -- 🔴 F9: BỎ `storage_fee` khỏi công thức — nó LUÔN = 0, trừ nó chỉ tạo
+    --        ẢO GIÁC là phí kho đã được tính. Storage thật: cấp tài khoản
+    --        (mart_amazon_channel_pnl_monthly) hoặc phân bổ theo cubic-foot-days
+    --        (mart_sku_storage_allocated). ĐỪNG thêm lại vào đây.
+    + COALESCE(safet_reimbursement, 0)
+    - COALESCE(return_label_cost, 0))      AS channel_contribution_margin_pre_cogs_pre_ads_pre_storage,
+
+  CURRENT_TIMESTAMP()                      AS _transformed_at
+FROM combined
+
+-- 🔴 F4b — MỘT mệnh đề WHERE duy nhất. Nhánh incremental nối bằng AND.
+WHERE sku IS NOT NULL
+  AND day IS NOT NULL
+  ${ when(incremental(), `AND day >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)`) }

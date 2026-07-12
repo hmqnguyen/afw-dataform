@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
+  assertions: {
+    uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
+    nonNull: ["amazon_order_id", "sku"]
+  },
   description: "Master returns — giữ lại TẤT CẢ lần trả hàng đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. Khác Settlement: CÓ logic UPDATE vì return_status/resolution có thể đổi theo thời gian xử lý (ví dụ: Requested -> Received -> Refunded).",
   tags: ["master", "amazon", "returns"],
   uniqueKey: ["amazon_order_id", "sku", "return_date_raw", "rma_id"],
@@ -18,23 +22,43 @@ config {
 -- trỏ tới 1 bảng tồn tại thật.
 pre_operations {
   CREATE TABLE IF NOT EXISTS ${self()} (
-    brand                  STRING,
-    amazon_order_id        STRING,
-    order_item_id          STRING,
-    rma_id                 STRING,
-    sku                    STRING,
-    asin                   STRING,
-    quantity               INT64,
-    return_date_raw        STRING,
-    return_timestamp       TIMESTAMP,
-    return_date            DATE,
-    return_reason          STRING,
-    return_status          STRING,
-    resolution              STRING,
-    fulfillment_center_id   STRING,
-    label_type              STRING,
-    label_cost               NUMERIC,
-    _ingested_at             TIMESTAMP
+    brand                       STRING,
+    amazon_order_id             STRING,
+    order_item_id               STRING,
+    rma_id                      STRING,
+    sku                         STRING,
+    asin                        STRING,
+    item_name                   STRING,
+    invoice_number              STRING,
+    tracking_id                 STRING,
+    quantity                    INT64,
+    order_quantity              INT64,
+    return_date_raw             STRING,
+    return_timestamp            TIMESTAMP,
+    return_date                 DATE,
+    order_date                  DATE,
+    return_delivery_date        DATE,
+    return_reason               STRING,
+    return_status               STRING,
+    resolution                  STRING,
+    return_type                 STRING,
+    in_policy                   STRING,
+    is_prime                    STRING,
+    return_carrier              STRING,
+    label_type                  STRING,
+    label_paid_by               STRING,
+    label_cost                  NUMERIC,
+    currency_code               STRING,
+    order_amount                NUMERIC,
+    refunded_amount             NUMERIC,
+    -- SafeT: Amazon BỒI HOÀN seller khi hàng trả về hỏng/mất (TIỀN VÀO)
+    safet_claim_id              STRING,
+    safet_claim_state           STRING,
+    safet_action_reason         STRING,
+    safet_reimbursement_amount  NUMERIC,
+    safet_claim_created_at      TIMESTAMP,
+    a_to_z_claim                STRING,
+    _ingested_at                TIMESTAMP
   )
   PARTITION BY return_date
   CLUSTER BY sku
@@ -56,6 +80,11 @@ pre_operations {
 -- qua khi cả 2 bên đều NULL (NULL = NULL luôn là UNKNOWN trong SQL, không
 -- phải TRUE).
 
+-- ⚠️ BỎ fulfillment_center_id: CỘT MA — staging cũ map một field KHÔNG TỒN TẠI
+-- trong report FBM returns (verify data thật: 0/519 dòng có giá trị). Giữ lại
+-- chỉ tạo ảo giác có dữ liệu.
+-- ⚠️ THÊM: SafeT reimbursement (TIỀN VÀO — Amazon bồi hoàn seller) + A-to-Z
+-- claim + label_paid_by + order_amount... trước đây bỏ sót khỏi P&L.
 SELECT
   s.brand,
   s.amazon_order_id,
@@ -63,18 +92,35 @@ SELECT
   s.rma_id,
   s.sku,
   s.asin,
+  s.item_name,
+  s.invoice_number,
+  s.tracking_id,
   s.quantity,
+  s.order_quantity,
   s.return_date_raw,
   s.return_timestamp,
   s.return_date,
+  s.order_date,
+  s.return_delivery_date,
   s.return_reason,
   s.return_status,
   s.resolution,
   s.return_type,
-  s.fulfillment_center_id,
+  s.in_policy,
+  s.is_prime,
+  s.return_carrier,
   s.label_type,
+  s.label_paid_by,
   s.label_cost,
+  s.currency_code,
+  s.order_amount,
   s.refunded_amount,
+  s.safet_claim_id,
+  s.safet_claim_state,
+  s.safet_action_reason,
+  s.safet_reimbursement_amount,
+  s.safet_claim_created_at,
+  s.a_to_z_claim,
   s._ingested_at
 FROM ${ref("stg_amazon_returns")} AS s
 ${ when(incremental(),

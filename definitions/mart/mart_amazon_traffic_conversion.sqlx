@@ -2,7 +2,7 @@ config {
   type: "table",
   schema: dataform.projectConfig.vars.mart_dataset,
   name: "mart_amazon_traffic_conversion",
-  description: "Chan doan doanh so: giam vi IT NGUOI XEM, vi XEM MA KHONG MUA, hay vi MAT BUY BOX. Grain: sku.",
+  description: "Chan doan doanh so: giam vi IT NGUOI XEM, vi XEM MA KHONG MUA, hay vi MAT BUY BOX. Grain: sku. F7 fix 2026-07-12: CTE stock thieu WHERE is_latest -> SUM(available) cong don qua MOI snapshot_date -> ton kho phong gap N lan (N = so ngay lich su) -> root_cause STOCKOUT khong bao gio trigger.",
   tags: ["amazon", "sales_traffic", "mart"],
   bigquery: { clusterBy: ["root_cause", "sku"] }
 }
@@ -25,7 +25,11 @@ config {
 
   Gop 3 thu nay lam mot ("doanh so giam") la ly do doi Sales chay lung tung.
 
-  ⚠️ LAYER INVARIANT: mart chi doc tu MASTER. Khong bao gio tu staging/raw.
+  ⚠️ LAYER INVARIANT (I1): mart chi doc tu MASTER. Khong bao gio tu staging/raw.
+
+  ⚠️ CAVEAT AD SPEND: mart nay KHONG co ad_spend. Ad spend an ~79% CM1 kenh
+     Amazon. 'TRAFFIC_DROP' co the don gian la "da tat ads" — kiem tra
+     AfwAdsDataform truoc khi ket luan la van de SEO/ranking.
   ═══════════════════════════════════════════════════════════════════════════
 */
 
@@ -40,10 +44,12 @@ current_7d AS (
     SUM(page_views)                          AS page_views,
     SUM(units_ordered)                       AS units_ordered,
     SUM(ordered_product_sales)               AS revenue,
-    -- CVR phai tinh lai tu tong, KHONG duoc lay AVG(unit_session_pct).
-    -- AVG cua ty le la SAI khi mau so khac nhau moi ngay.
+    -- ✅ G6 (da dung san): CVR phai tinh lai tu TONG, KHONG duoc lay
+    -- AVG(unit_session_pct). Trung binh cua ty le ≠ ty le cua tong khi mau so
+    -- khac nhau moi ngay.
     SAFE_DIVIDE(SUM(units_ordered), NULLIF(SUM(sessions), 0)) * 100 AS cvr_pct,
-    -- Buy Box thi AVG hop ly hon (la ty le thoi gian, khong phai ty le count)
+    -- Buy Box thi AVG hop ly hon (la ty le THOI GIAN giu Buy Box trong ngay,
+    -- khong phai ty le count).
     AVG(buy_box_pct)                         AS buy_box_pct,
     COUNTIF(sessions = 0)                    AS zero_session_days
   FROM ${ref("master_amazon_sales_traffic_by_asin")}
@@ -69,12 +75,40 @@ prior_7d AS (
   GROUP BY sku
 ),
 
--- ── Ton kha dung, de tach STOCKOUT ra khoi cac nguyen nhan khac ────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F7 FIX — CTE `stock`
+
+   BAN CU:
+       SELECT sku, SUM(available) AS available_qty
+       FROM master_amazon_inventory_planning
+       GROUP BY sku                                  -- ⚠️ KHONG CO FILTER
+
+   Quyet dinh kien truc §3 doi master snapshot tu "latest-state" sang
+   "TOAN BO LICH SU + cot is_latest". Mart nay KHONG duoc cap nhat theo.
+   ⇒ SUM(available) cong don qua MOI snapshot_date da tung ton tai.
+   ⇒ Sau 90 ngay chay daily, ton kho bao cao SAI GAP ~90 LAN.
+   ⇒ `available_qty = 0` gan nhu KHONG BAO GIO dung → nhanh 'STOCKOUT' CHET.
+      SKU het hang bi chan doan nham thanh 'TRAFFIC_DROP' hoac 'CONVERSION_DROP'
+      → Marketing/Sales duoc giao viec vo nghia trong khi van de that la HET HANG.
+
+   BAN MOI: WHERE is_latest — dung dung muc dich cot nay duoc sinh ra.
+
+   ⚠️ CANH BAO CHUNG: `is_latest` duoc dinh nghia tren 5 master snapshot
+   (inventory, inventory_planning, inventory_ledger, listings, storage_fees)
+   nhung TRUOC PATCH NAY KHONG DUOC DUNG O BAT KY FACT/MART NAO. Moi mart moi
+   doc master snapshot PHAI tu hoi: minh can LATEST-STATE hay TIME-SERIES?
+     - latest-state  → WHERE is_latest
+     - time-series   → khong filter (vd: mart_amazon_listing_price_monitor dung
+                       LAG theo snapshot_date; mart_sku_storage_allocated can
+                       chuoi ledger theo ngay)
+   Quen filter = phong so am tham, KHONG bao loi.
+   ═══════════════════════════════════════════════════════════════════════════ */
 stock AS (
   SELECT
     sku,
-    SUM(available) AS available_qty
-  FROM ${ref("master_amazon_inventory_planning")}   -- cột `available` (đã verify với payload thật 2026-07-09)
+    SUM(available) AS available_qty     -- SUM qua `condition` (New/Used) trong CUNG 1 snapshot
+  FROM ${ref("master_amazon_inventory_planning")}
+  WHERE is_latest                        -- 🔴 F7: CHI snapshot MOI NHAT
   GROUP BY sku
 ),
 
@@ -109,7 +143,10 @@ joined AS (
     c.revenue - p.revenue                             AS d_revenue,
 
     c.zero_session_days,
-    IFNULL(s.available_qty, 0)                        AS available_qty,
+    -- 🔴 F8: GIU NGUYEN NULL. IFNULL(...,0) truoc day bien "SKU khong ton tai o
+    -- FBA" thanh "SKU het hang" -> 144 SKU FBM deu bi chan doan STOCKOUT gia.
+    s.available_qty                                   AS available_qty,
+    (s.available_qty IS NULL)                         AS not_in_fba_inventory,
 
     /*
       ── PHAN RA DONG GOP ─────────────────────────────────────────────────
@@ -144,7 +181,20 @@ SELECT
     WHEN sessions_7d = 0 AND IFNULL(sessions_prior_7d, 0) > 0
       THEN 'LISTING_DEAD'
 
-    -- Het hang: khong phai loi Sales, khong phai loi listing
+    -- 🔴 F8 — Het hang THAT: CO dong trong inventory_planning VA available = 0.
+    --
+    -- available_qty gio CO THE NULL (SKU khong ton tai o FBA — vd 144 listing FBM).
+    -- SQL: NULL = 0 -> UNKNOWN -> nhanh nay KHONG fire -> SKU FBM roi xuong
+    -- BUY_BOX_LOSS / TRAFFIC_DROP / CONVERSION_DROP nhu binh thuong. DUNG y do.
+    --
+    -- ⚠️ DUNG bao gio boc lai `IFNULL(available_qty, 0)`: se bien MOI SKU FBM
+    -- thanh 'STOCKOUT' gia (144/246 listing) + khuyen nghi "dieu hang cheo kho"
+    -- vo nghia. Cung KHONG duoc "chuan hoa" sku de ep join (I5):
+    -- `amzn.gr.FBA-200100-xxx` la 23 listing THAT, `FBA -815250` != `FBA- 815250`.
+    --
+    -- ⚠️ HE QUA CON LAI: SKU FBM het hang o Lecangs -> mart nay KHONG phat hien duoc.
+    -- Can nguon ton kho FBM (Lecangs/Castlegate) moi bit duoc lo hong nay.
+    -- Xem cot `not_in_fba_inventory` de biet dong nao khong duoc kiem tra ton kho.
     WHEN available_qty = 0
       THEN 'STOCKOUT'
 
@@ -168,13 +218,13 @@ SELECT
     WHEN sessions_7d = 0 AND IFNULL(sessions_prior_7d, 0) > 0
       THEN 'Listing khong con hien thi. Kiem tra suppressed / inactive / het anh / vi pham policy. KHONG phai van de gia.'
     WHEN available_qty = 0
-      THEN 'Het hang. Xem mart_channel_stockout_forecast de dieu hang cheo kho. Tat ads ngay.'
+      THEN 'Het hang o FBA. Lead time NM5->FBA = 210 ngay -> PO KHONG CUU DUOC. Chi dieu hang cheo kho (Lecangs/Castlegate) moi kip. Tat ads ngay.'
     WHEN buy_box_7d < 70 OR d_buy_box_pt < -15
       THEN 'Mat Buy Box. Khach VAN vao xem nhung nut mua thuoc seller khac. Kiem tra gia vs doi thu + tinh trang ton kho.'
     WHEN IFNULL(d_units, 0) >= 0
       THEN 'On dinh.'
     WHEN ABS(units_lost_from_traffic) > ABS(units_lost_from_cvr)
-      THEN 'IT NGUOI XEM. Listing van chuyen doi tot. Van de o dau phieu: ads, keyword, SEO, ranking. -> Marketing.'
+      THEN 'IT NGUOI XEM. Listing van chuyen doi tot. Van de o dau phieu: ads, keyword, SEO, ranking. KIEM TRA AD SPEND TRUOC (co the chi la da tat ads). -> Marketing.'
     ELSE 'XEM MA KHONG MUA. Traffic van co, nhung khach khong bam mua. Van de o listing: gia, anh, review, mo ta, ship. -> Sales/Content.'
   END AS diagnosis,
 

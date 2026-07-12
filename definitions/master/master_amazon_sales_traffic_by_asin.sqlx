@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   name: "master_amazon_sales_traffic_by_asin",
-  description: "Master Sales & Traffic cap SKU. Grain: report_date x sku. Nguon cho mart traffic/conversion.",
+  description: "Master Sales & Traffic cấp SKU. Grain: report_date × sku (G1: payload KHÔNG có field date → 1 report / 1 ngày là BẮT BUỘC). Nguồn cho mart_amazon_traffic_conversion + mart_amazon_buybox_daily. F6 fix 2026-07-12: filter incremental đổi từ cửa sổ report_date 35 ngày sang WATERMARK _ingested_at.",
   tags: ["amazon", "sales_traffic", "master"],
   uniqueKey: ["dedup_key"],
   bigquery: {
@@ -15,7 +15,33 @@ config {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F6 — TẠI SAO BỎ `WHERE report_date >= DATE_SUB(CURRENT_DATE(), 35 DAY)`
+
+   Filter CŨ lọc theo NGÀY BÁO CÁO. Nhưng backfill/vá thủng nạp data có
+   report_date CŨ vào lúc HIỆN TẠI. Hai chiều thời gian này KHÔNG trùng nhau.
+
+   Ví dụ thật — §7 bước 4 bảo vá 3 ngày thủng (hôm nay 2026-07-12):
+       2026-04-16  → 87 ngày trước  → ❌ BỊ LỌC BỎ, không vào master
+       2026-05-10  → 63 ngày trước  → ❌ BỊ LỌC BỎ, không vào master
+       2026-07-02  → 10 ngày trước  → ✅ vào được
+
+   Anh chạy SalesTrafficSync, thấy raw có, staging có → tưởng xong. Master vẫn
+   thủng 2 ngày. Và assert_no_date_gaps đọc STAGING (không phải master) nên
+   CŨNG KHÔNG BÁO. Thủng âm thầm — đúng loại lỗi mà FailureTracker sinh ra để
+   diệt, nhưng lại tái xuất hiện ở tầng transform.
+
+   Filter MỚI (Q3) = WATERMARK trên _ingested_at, giống hệt 12 staging:
+       "nạp mọi dòng MỚI ĐƯỢC GHI kể từ lần chạy trước"
+   → report_date cũ tới đâu cũng vào được. Backfill 546 ngày cũng vào được.
+   → Đồng thời loại được rủi ro Amazon RESTATE (G4): bản restate có
+     _ingested_at mới hơn → luôn lọt watermark → MERGE theo dedup_key ghi đè
+     bản cũ. Cửa sổ 35 ngày cũ chỉ TÌNH CỜ che được ca này.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 pre_operations {
+  -- (1) Bảng phải tồn tại trước khi ${self()} được tham chiếu trong watermark.
+  --     ⚠️ SCHEMA PHẢI KHỚP CHÍNH XÁC với câu SELECT (stg_* + _loaded_at).
   CREATE TABLE IF NOT EXISTS ${self()} (
     report_date           DATE,
     report_id             STRING,
@@ -40,7 +66,16 @@ pre_operations {
     _loaded_at            TIMESTAMP
   )
   PARTITION BY report_date
-  CLUSTER BY sku, child_asin
+  CLUSTER BY sku, child_asin;
+
+  -- (2) 🔴 F6 — WATERMARK. Dùng BIẾN, không subquery inline: BigQuery coi biến
+  --     là hằng số nên PRUNE được partition của staging; subquery inline trong
+  --     WHERE sẽ full-scan.
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
 }
 
 SELECT
@@ -49,5 +84,5 @@ SELECT
 FROM ${ref("stg_amazon_sales_traffic_by_asin")} s
 
 ${when(incremental(), `
-WHERE s.report_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+WHERE s._ingested_at > ingested_at_checkpoint
 `)}

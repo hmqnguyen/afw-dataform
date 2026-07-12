@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["snapshot_date", "sku"],
+    nonNull: ["snapshot_date", "sku"]
+  },
   uniqueKey: ["snapshot_date", "sku"],
   description: "Staging inventory — parse JSON từ raw + dedupe theo (snapshot_date, sku), gộp trong 1 bước. Không lưu raw_payload/metadata.",
   tags: ["staging", "amazon", "inventory"],
@@ -62,6 +66,33 @@ WITH parsed AS (
                                                                                   AS reserved_pending_customer_order,
     SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.reservedQuantity.pendingTransshipmentQuantity') AS INT64)
                                                                                   AS reserved_pending_transshipment,
+    -- ⚠️ BUCKET THỨ 3 (trước đây BỊ SÓT — verify data thật 2026-07-12):
+    -- reservedQuantity có 3 thành phần, không phải 2. Kiểm chứng trên 50 SKU:
+    --   reserved_quantity != pending_customer_order + pending_transshipment
+    --   ở 4/50 SKU (vd sku 903061: reserved=1 nhưng 2 bucket kia = 0).
+    --   Phần chênh chính là fcProcessingQuantity (hàng đang được xử lý tại FC).
+    -- Thiếu cột này → đẳng thức reserved KHÔNG khớp, và tồn kho "đang kẹt ở FC"
+    -- trở nên vô hình.
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.reservedQuantity.fcProcessingQuantity') AS INT64)
+                                                                                  AS reserved_fc_processing,
+
+    -- ── researchingQuantity — hàng Amazon ĐANG ĐIỀU TRA (mất/lệch kiểm kê) ──
+    -- ⚠️ LÀ MỘT PHẦN CỦA total_quantity. Đẳng thức ĐẦY ĐỦ (verify 50 SKU thật):
+    --   total = fulfillable + inbound(3) + reserved + unfulfillable + researching
+    -- Hiện data = 0 ở cả 50 SKU, nhưng khi phát sinh mà không map thì tồn kho
+    -- "đang tranh chấp" sẽ vô hình.
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.researchingQuantity.totalResearchingQuantity') AS INT64)
+                                                                                  AS researching_quantity,
+
+    -- ── futureSupplyQuantity — CHƯA MAP, NHƯNG CÓ DATA THẬT (7/50 SKU) ──
+    -- futureSupplyBuyableQuantity lên tới 120 đơn vị (sku 902031). Đây là hàng
+    -- SẼ khả dụng để bán trong tương lai → ẢNH HƯỞNG TRỰC TIẾP tới planning/ATS.
+    -- ⚠️ KHÔNG nằm trong total_quantity (là nguồn cung tương lai, không phải tồn
+    --   hiện có) → đừng cộng vào đẳng thức trên.
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.futureSupplyQuantity.futureSupplyBuyableQuantity') AS INT64)
+                                                                                  AS future_supply_buyable,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.futureSupplyQuantity.reservedFutureSupplyQuantity') AS INT64)
+                                                                                  AS reserved_future_supply,
 
     SAFE_CAST(JSON_VALUE(raw_payload, '$.inventoryDetails.unfulfillableQuantity.totalUnfulfillableQuantity') AS INT64)
                                                                                   AS unfulfillable_quantity,
@@ -116,6 +147,10 @@ SELECT
   reserved_quantity,
   reserved_pending_customer_order,
   reserved_pending_transshipment,
+  reserved_fc_processing,
+  researching_quantity,
+  future_supply_buyable,
+  reserved_future_supply,
   unfulfillable_quantity,
   unfulfillable_customer_damaged,
   unfulfillable_warehouse_damaged,

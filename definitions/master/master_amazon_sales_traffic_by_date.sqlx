@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   name: "master_amazon_sales_traffic_by_date",
-  description: "Master Sales & Traffic cap kenh. Latest-state theo report_date.",
+  description: "Master Sales & Traffic cấp KÊNH (1 dòng/ngày). Latest-state theo report_date. F3b + F6 fix 2026-07-12: pre_operations thiếu cột _ingested_at (schema mismatch → MERGE INSERT fail); filter incremental đổi từ cửa sổ report_date 35 ngày sang watermark _ingested_at.",
   tags: ["amazon", "sales_traffic", "master"],
   uniqueKey: ["report_date"],
   bigquery: {
@@ -15,11 +15,25 @@ config {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F3b — pre_operations CŨ tạo bảng 21 cột, KHÔNG có `_ingested_at`.
+   Nhưng stg_amazon_sales_traffic_by_date trả về 22 cột, cột CUỐI là
+   `_ingested_at` (dòng 74 của file staging). ⇒ MERGE ... WHEN NOT MATCHED
+   THEN INSERT ROW ném "Column _ingested_at is not present in table".
+   Cùng lớp lỗi với F3 ở master_amazon_orders.
+
+   Lỗi này còn nghiêm trọng hơn sau khi chọn Q3: WATERMARK _ingested_at
+   CẦN CHÍNH CỘT NÀY tồn tại trong master. Không có cột → watermark vô nghĩa.
+
+   🔴 F6 — filter incremental: cửa sổ `report_date >= CURRENT_DATE - 35` chặn
+   mọi backfill/vá thủng có report_date cũ. Xem giải thích đầy đủ ở
+   master_amazon_sales_traffic_by_asin.sqlx.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 pre_operations {
-  /*
-    Dataform incremental() self-join se HONG o lan chay dau khi bang chua ton tai.
-    Bat buoc CREATE TABLE IF NOT EXISTS truoc (cung pattern voi cac master khac).
-  */
+  -- (1) Bảng phải tồn tại trước khi ${self()} được tham chiếu.
+  --     ⚠️ SCHEMA KHỚP CHÍNH XÁC 22 cột của staging + _loaded_at = 23 cột.
+  --     Thứ tự PHẢI khớp câu SELECT của staging (report_date → ... → _ingested_at).
   CREATE TABLE IF NOT EXISTS ${self()} (
     report_date               DATE,
     report_id                 STRING,
@@ -42,10 +56,28 @@ pre_operations {
     order_item_session_pct    FLOAT64,
     avg_offer_count           INT64,
     negative_feedback         INT64,
+    _ingested_at              TIMESTAMP,   -- 🔴 F3b: THIẾU trong bản cũ
     _loaded_at                TIMESTAMP
   )
   PARTITION BY report_date
+  CLUSTER BY report_id;
+
+  -- (2) 🔴 F6 — WATERMARK (thay cửa sổ report_date 35 ngày).
+  DECLARE ingested_at_checkpoint DEFAULT (
+    ${when(incremental(),
+      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
+      `SELECT TIMESTAMP('1970-01-01')`)}
+  )
 }
+
+-- G4 (Amazon RESTATE 2-3 ngày): bản restate luôn có _ingested_at MỚI HƠN →
+-- luôn lọt watermark → MERGE theo uniqueKey=report_date GHI ĐÈ bản cũ.
+-- Đây là latest-wins đúng nghĩa, không phụ thuộc cửa sổ ngày cố định.
+--
+-- G6 (data lag = 2 ngày, KHÔNG phải 1): payload 2026-07-10 có
+-- orderedProductSales=12989 nhưng sessions=0/pageViews=0/buyBox=0 — traffic
+-- CHƯA VỀ. Chống ở tầng SERVICE (DataLagDays=2), không ở đây: nếu lọc ở đây
+-- thì ngày lag sẽ không bao giờ được cập nhật lại khi traffic về sau.
 
 SELECT
   s.*,
@@ -53,9 +85,5 @@ SELECT
 FROM ${ref("stg_amazon_sales_traffic_by_date")} s
 
 ${when(incremental(), `
-/*
-  Cua so xu ly lai 35 ngay: khop voi fact_sku_pnl_daily.
-  Amazon restate ~3 ngay, nhung de rong de bat ca truong hop backfill.
-*/
-WHERE s.report_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+WHERE s._ingested_at > ingested_at_checkpoint
 `)}

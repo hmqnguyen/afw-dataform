@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["snapshot_date", "seller_sku"],
+    nonNull: ["snapshot_date", "seller_sku"]
+  },
   uniqueKey: ["snapshot_date", "seller_sku"],
   description: "Staging Merchant Listings ALL — snapshot theo NGÀY (snapshot_date = DATE(_ingested_at)). Mỗi SKU 1 dòng/ngày → dựng chuỗi giá list để theo dõi biến động. ⚠️ Tên cột lấy từ docs report, verify với data thật.",
   tags: ["staging", "amazon", "listings"],
@@ -40,12 +44,46 @@ WITH parsed AS (
     JSON_VALUE(raw_payload, '$."item-name"')                    AS item_name,
     JSON_VALUE(raw_payload, '$."listing-id"')                   AS listing_id,
     JSON_VALUE(raw_payload, '$."product-id"')                   AS product_id,
-    JSON_VALUE(raw_payload, '$."item-condition"')               AS item_condition,
+    JSON_VALUE(raw_payload, '$."item-condition"')               AS item_condition,      -- MÃ SỐ, không phải chữ
+    -- item-condition là MÃ SỐ (data thật: 11=225, 1=13, 2=7, 3=1). Dịch ra nhãn
+    -- để mart/báo cáo đọc được mà không phải tra bảng.
+    CASE JSON_VALUE(raw_payload, '$."item-condition"')
+      WHEN '11' THEN 'New'
+      WHEN '10' THEN 'Refurbished'
+      WHEN '1'  THEN 'Used - Like New'
+      WHEN '2'  THEN 'Used - Very Good'
+      WHEN '3'  THEN 'Used - Good'
+      WHEN '4'  THEN 'Used - Acceptable'
+      WHEN '5'  THEN 'Collectible - Like New'
+      WHEN '6'  THEN 'Collectible - Very Good'
+      WHEN '7'  THEN 'Collectible - Good'
+      WHEN '8'  THEN 'Collectible - Acceptable'
+      ELSE NULL
+    END                                                         AS item_condition_label,
     JSON_VALUE(raw_payload, '$."fulfillment-channel"')          AS fulfillment_channel,  -- DEFAULT=FBM, AMAZON_*=FBA
     JSON_VALUE(raw_payload, '$."status"')                       AS status,               -- Active/Inactive/Incomplete
     SAFE_CAST(JSON_VALUE(raw_payload, '$."price"') AS NUMERIC)   AS price,                -- giá list hiện tại
     SAFE_CAST(JSON_VALUE(raw_payload, '$."quantity"') AS INT64)  AS quantity,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."open-date"') AS TIMESTAMP) AS open_date,
+    -- ⚠️ BUG ĐÃ VÁ: open-date có VIẾT TẮT MÚI GIỜ (data thật: '2026-01-18 23:24:51 PST',
+    --    'PDT' 192 dòng / 'PST' 54 dòng). SAFE_CAST(... AS TIMESTAMP) KHÔNG parse
+    --    được chuỗi này → NULL 100% (246/246). Phải cắt phần viết tắt rồi
+    --    PARSE_TIMESTAMP với timezone Pacific — PST/PDT đều là America/Los_Angeles,
+    --    BigQuery tự xử lý DST theo ngày.
+    SAFE.PARSE_TIMESTAMP(
+      '%Y-%m-%d %H:%M:%S',
+      REGEXP_EXTRACT(JSON_VALUE(raw_payload, '$."open-date"'),
+                     r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'),
+      'America/Los_Angeles'
+    )                                                           AS open_date,
+
+    -- ── Cột CÓ DATA THẬT nhưng trước đây chưa map ──
+    -- pending_quantity: số lượng đang chờ xử lý (chỉ listing FBM có — 144/246)
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."pending-quantity"') AS INT64)
+                                                                AS pending_quantity,
+    -- product_id_type: 1=ASIN, 2=ISBN, 3=UPC, 4=EAN → biết product_id là loại gì
+    JSON_VALUE(raw_payload, '$."product-id-type"')              AS product_id_type,
+    JSON_VALUE(raw_payload, '$."merchant-shipping-group"')      AS merchant_shipping_group,
+    JSON_VALUE(raw_payload, '$."item-note"')                    AS item_note,
     _ingested_at
   FROM ${ref("raw_amazon_listings")}
   WHERE brand = 'AFW'

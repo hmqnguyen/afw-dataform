@@ -1,31 +1,53 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
-  description: "Master settlement — giữ lại TẤT CẢ giao dịch settlement đã từng thấy, KHÔNG bị xóa làm lại mỗi lần chạy. INSERT-ONLY: giao dịch settlement coi là KHÔNG ĐỔI sau khi Amazon đã ghi nhận, nên không có logic UPDATE — chỉ thêm giao dịch mới, bỏ qua giao dịch đã có.",
+  assertions: {
+    uniqueKey: ["settlement_key"],
+    nonNull: ["settlement_key", "settlement_id", "posted_date"]
+  },
+  uniqueKey: ["settlement_key"],
+  description: "Master settlement — INSERT-ONLY: giao dịch settlement coi là BẤT BIẾN sau khi Amazon ghi nhận, nên không có logic UPDATE. Dedup theo settlement_key (hash NULL-safe từ staging). F5 fix 2026-07-12: khoá composite 6 cột cũ dùng amazon_order_id trong MERGE ON → dòng adjustment/reimbursement (order-id NULL, sku NOT NULL) không bao giờ match → INSERT lại mỗi lần chạy → total_settlement_amount phồng dần trong fact.",
   tags: ["master", "amazon", "settlement"],
-  uniqueKey: [
-    "settlement_id", "amazon_order_id", "sku",
-    "amount_type", "amount_description", "posted_date_time"
-  ],
   bigquery: {
     partitionBy: "posted_date",
     clusterBy: ["sku", "amount_type"]
   }
 }
 
--- LƯU Ý QUAN TRỌNG (đã xác nhận thật qua lỗi runtime): incremental() có
--- thể trả về true (compile ra LEFT JOIN ${self()}) NGAY CẢ KHI bảng đích
--- chưa từng được tạo — đây là edge-case đã biết của Dataform khi action
--- đã có trong dependency graph nhưng chưa từng chạy thành công lần nào.
--- Hậu quả: "Not found: Table ... was not found in location US".
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F5 — thay đổi so với bản cũ
+
+   CŨ:  uniqueKey = [settlement_id, amazon_order_id, sku, amount_type,
+                     amount_description, posted_date_time]   (6 cột, BỎ amount)
+        LEFT JOIN ${self()} ON s.amazon_order_id = m.amazon_order_id AND ...
+
+        → 2 lỗi cùng lúc:
+          (a) NULL-unsafe: amazon_order_id NULL (dòng adjustment/reimbursement)
+              → NULL = NULL → UNKNOWN → không match → INSERT lại MỖI LẦN CHẠY.
+          (b) LỆCH KHOÁ với staging: staging dedup theo 7 cột (CÓ amount),
+              master MERGE theo 6 cột (KHÔNG amount). Hai dòng khác nhau ở
+              amount → staging giữ cả 2, master MERGE coi là 1 → BigQuery ném
+              "UPDATE/MERGE must match at most one source row for each target row".
+
+   MỚI: uniqueKey = [settlement_key]  — hash NULL-safe của ĐỦ 7 cột, tính ở staging.
+        → NULL-safe, và staging ↔ master DÙNG CHUNG MỘT KHOÁ. Hết cả (a) lẫn (b).
+
+   Cùng pattern với fee_key ở master_amazon_settlement_fees.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+-- LƯU Ý (đã xác nhận qua lỗi runtime thật): incremental() có thể trả về true
+-- (compile ra LEFT JOIN ${self()}) NGAY CẢ KHI bảng đích chưa từng được tạo —
+-- edge-case Dataform khi action đã có trong dependency graph nhưng chưa chạy
+-- thành công lần nào. Hậu quả: "Not found: Table ... was not found in location US".
+-- pre_operations CHỦ ĐỘNG tạo bảng rỗng đúng schema TRƯỚC câu SELECT chính.
 --
--- pre_operations dưới đây CHỦ ĐỘNG tạo bảng rỗng (đúng schema) TRƯỚC khi
--- câu SELECT chính chạy — đảm bảo ${self()} luôn trỏ tới 1 bảng tồn tại
--- thật, bất kể incremental() đánh giá đúng hay sai. Đây là cách giải
--- quyết triệt để, tự động hoàn toàn — không cần đổi type thủ công hay
--- chạy full-refresh riêng cho lần đầu.
+-- ⚠️ SCHEMA DƯỚI ĐÂY PHẢI KHỚP CHÍNH XÁC 100% VỚI DANH SÁCH CỘT CỦA CÂU SELECT.
+--    Thiếu 1 cột → MERGE ... WHEN NOT MATCHED THEN INSERT ROW ném
+--    "Column X is not present in table". Đây là lỗi F3 đã xảy ra ở
+--    master_amazon_orders. Sửa SELECT thì PHẢI sửa cả block này.
 pre_operations {
   CREATE TABLE IF NOT EXISTS ${self()} (
+    settlement_key                STRING,
     brand                         STRING,
     settlement_id                 STRING,
     amazon_order_id               STRING,
@@ -50,33 +72,27 @@ pre_operations {
     settlement_end_date           DATE,
     posted_date                   DATE,
     posted_date_time              TIMESTAMP,
-    deposit_date                  DATE
+    deposit_date                  DATE,
+    _ingested_at                  TIMESTAMP
   )
   PARTITION BY posted_date
   CLUSTER BY sku, amount_type
 }
 
--- CÁCH HOẠT ĐỘNG (sau khi có pre_operations ở trên):
---   Lần đầu chạy: pre_operations tạo bảng rỗng → câu SELECT chính chạy,
---   LEFT JOIN vào bảng rỗng đó → mọi dòng từ stg_amazon_settlement đều
---   "chưa có trong master" → toàn bộ được INSERT.
+-- CÁCH HOẠT ĐỘNG:
+--   Lần đầu: pre_operations tạo bảng rỗng → LEFT JOIN vào bảng rỗng → mọi
+--   settlement_key đều "chưa có" → toàn bộ INSERT.
 --
---   Từ lần 2 trở đi: pre_operations thấy bảng đã tồn tại → bỏ qua (IF NOT
---   EXISTS) → chỉ đưa vào MERGE những giao dịch CHƯA từng có trong master
---   (theo composite key). Giao dịch đã có → KHÔNG xuất hiện trong USING
---   clause → MERGE không động vào → giữ nguyên 100%.
+--   Từ lần 2: chỉ đưa vào USING clause những settlement_key CHƯA từng có.
+--   Giao dịch đã có → không xuất hiện trong USING → MERGE không động vào →
+--   giữ nguyên 100%.
 --
 --   KHÁC master_amazon_orders: KHÔNG có điều kiện "mới hơn" vì settlement
---   không có cột nghiệp vụ nào biểu thị "Amazon đã sửa lại giao dịch này"
---   — coi giao dịch settlement là bất biến sau khi ghi nhận.
---
--- LƯU Ý uniqueKey: amount (số tiền) KHÔNG nằm trong uniqueKey vì BigQuery
--- MERGE ON clause khó xử lý NUMERIC so sánh trực tiếp ổn định — composite
--- key 6 cột (bỏ amount) vẫn đủ phân biệt 99% trường hợp; nếu có 2 dòng
--- trùng cả 6 cột nhưng khác amount (hiếm), dòng INSERT đầu tiên sẽ là dòng
--- duy nhất được giữ — lỗi này nên được resolve ở nguồn (raw) nếu gặp.
+--   không có cột nghiệp vụ nào biểu thị "Amazon đã sửa lại giao dịch này".
+--   Amazon sửa giao dịch = post 1 giao dịch ĐẢO NGƯỢC mới, không sửa dòng cũ.
 
 SELECT
+  s.settlement_key,
   s.brand,
   s.settlement_id,
   s.amazon_order_id,
@@ -101,16 +117,11 @@ SELECT
   s.settlement_end_date,
   s.posted_date,
   s.posted_date_time,
-  s.deposit_date
+  s.deposit_date,
+  s._ingested_at
 FROM ${ref("stg_amazon_settlement")} AS s
 ${ when(incremental(),
-  `LEFT JOIN ${self()} AS m
-    ON  s.settlement_id = m.settlement_id
-    AND s.amazon_order_id = m.amazon_order_id
-    AND s.sku = m.sku
-    AND s.amount_type = m.amount_type
-    AND s.amount_description = m.amount_description
-    AND s.posted_date_time = m.posted_date_time`
+  `LEFT JOIN ${self()} AS m ON s.settlement_key = m.settlement_key`
 ) }
 
-${ when(incremental(), `WHERE m.settlement_id IS NULL`) }
+${ when(incremental(), `WHERE m.settlement_key IS NULL`) }

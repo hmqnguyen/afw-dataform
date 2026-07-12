@@ -1,0 +1,45 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  name: "assert_settlement_fees_no_unmapped",
+  description: "CỜ ĐỎ: mọi dòng phí cấp tài khoản PHẢI được map vào cost_group. UNMAPPED > 0 nghĩa là Amazon thêm loại phí mới và khoản đó đang BIẾN MẤT KHỎI P&L — âm thầm, không báo lỗi.",
+  tags: ["assertion", "amazon", "settlement_fees"]
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════════════════
+  TẠI SAO ASSERTION NÀY TỒN TẠI (bug #10)
+
+  Taxonomy CŨ chỉ soi `amount_description`. Ad spend của Amazon có:
+      amount_type        = 'Cost of Advertising'
+      amount_description = 'TransactionTotalAmount'   ← không chứa "advertis"
+
+  ⇒ 210 dòng, −$104,679 — KHOẢN CHI LỚN NHẤT — rơi vào UNMAPPED và BIẾN MẤT
+    khỏi P&L. Không ai biết, vì không có gì báo lỗi. Số vẫn ra, chỉ là SAI.
+
+  Assertion này biến lỗi-âm-thầm thành lỗi-ồn-ào. Amazon thêm phí mới bất kỳ
+  lúc nào → pipeline FAIL ngay, thay vì âm thầm bỏ tiền ra khỏi báo cáo.
+
+  KHI FAIL — làm gì:
+    1. Chạy query dưới để xem Amazon vừa thêm loại phí gì.
+    2. Quyết định cost_group (MARKETING / LOGISTICS / RETURNS / TAX / EXCLUDED).
+    3. ⚠️ SOI `amount_type` TRƯỚC, rồi mới `amount_description` — đó chính là
+       bài học của bug #10. Đừng lặp lại.
+    4. Sửa `definitions/staging/stg_amazon_settlement_fees.sqlx`.
+
+       SELECT amount_type, amount_description, COUNT(*) n, ROUND(SUM(amount),2) total
+       FROM `afw_amazon_master.master_amazon_settlement_fees`
+       WHERE cost_group = 'UNMAPPED'
+       GROUP BY 1, 2 ORDER BY ABS(SUM(amount)) DESC;
+  ═══════════════════════════════════════════════════════════════════════════
+*/
+
+SELECT
+  fee_key,
+  posted_date,
+  amount_type,
+  amount_description,
+  amount,
+  cost_group
+FROM ${ref("master_amazon_settlement_fees")}
+WHERE cost_group = 'UNMAPPED'

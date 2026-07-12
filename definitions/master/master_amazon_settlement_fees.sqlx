@@ -1,6 +1,10 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
+  assertions: {
+    uniqueKey: ["fee_key"],
+    nonNull: ["fee_key", "posted_date"]
+  },
   description: "Master phí settlement CẤP TÀI KHOẢN (sku IS NULL) — nguồn cho mọi mart phân bổ chi phí (storage, ads, subscription). Có cost_group theo taxonomy; nhóm UNMAPPED = cờ đỏ khi Amazon thêm loại phí mới.",
   tags: ["master", "amazon", "settlement_fees"],
   bigquery: { partitionBy: "posted_date", clusterBy: ["cost_group"] }

@@ -1,6 +1,10 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
+  assertions: {
+    uniqueKey: ["snapshot_date", "sku"],
+    nonNull: ["snapshot_date", "sku"]
+  },
   description: "Master — tồn kho FBA. GIỮ TOÀN BỘ LỊCH SỬ (mọi snapshot_date) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(snapshot_date)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "inventory"],
   bigquery: { partitionBy: "snapshot_date", clusterBy: ["sku"] }

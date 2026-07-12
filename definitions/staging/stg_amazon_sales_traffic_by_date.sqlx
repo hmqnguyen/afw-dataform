@@ -5,6 +5,7 @@ config {
   name: "stg_amazon_sales_traffic_by_date",
   description: "Sales & Traffic cap KENH, 1 dong/ngay. Parse verbatim JSON tu raw.",
   tags: ["amazon", "sales_traffic", "staging"],
+  bigquery: { partitionBy: "report_date" },
   assertions: {
     uniqueKey: ["report_date"],
     nonNull: ["report_date"]

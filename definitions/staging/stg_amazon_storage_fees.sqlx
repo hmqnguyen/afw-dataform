@@ -1,6 +1,10 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
+  assertions: {
+    uniqueKey: ["month_of_charge", "asin", "fnsku", "fulfillment_center"],
+    nonNull: ["month_of_charge", "asin"]
+  },
   uniqueKey: ["month_of_charge", "asin", "fnsku", "fulfillment_center"],
   description: "Staging FBA storage fees (per-ASIN, theo tháng) — nguồn để phân bổ storage về SKU. ⚠️ Tên cột CHƯA verify với data thật.",
   tags: ["staging", "amazon", "storage_fees"],

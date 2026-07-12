@@ -1,6 +1,10 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
+  assertions: {
+    uniqueKey: ["ledger_date", "msku", "fnsku", "disposition", "location"],
+    nonNull: ["ledger_date", "msku"]
+  },
   description: "Master — sổ cái tồn kho DAILY. GIỮ TOÀN BỘ LỊCH SỬ (mọi ledger_date) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(ledger_date)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "inventory_ledger"],
   bigquery: { partitionBy: "ledger_date", clusterBy: ["msku"] }

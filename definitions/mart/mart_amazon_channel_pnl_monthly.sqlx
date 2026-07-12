@@ -1,0 +1,202 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.mart_dataset,
+  name: "mart_amazon_channel_pnl_monthly",
+  description: "P&L kênh Amazon theo THÁNG — nơi DUY NHẤT có ad spend, storage, cước nhập khẩu. Grain: month × brand × channel. Sinh ra vì 3 khoản này CHỈ TỒN TẠI Ở CẤP TÀI KHOẢN (0 dòng có SKU) → không phân bổ xuống SKU được mà không bịa giả định. fact_sku_pnl_daily cố ý KHÔNG chứa chúng.",
+  tags: ["mart", "amazon", "channel_pnl"],
+  bigquery: { partitionBy: "month", clusterBy: ["brand"] }
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════════════════
+  TẠI SAO CÓ BẢNG NÀY (F9 — quyết định A, 2026-07-12)
+
+  Bug #10 phát hiện: ad spend −$104,679 nằm SẴN trong settlement, nhưng bị
+  taxonomy cũ ném vào UNMAPPED vì:
+
+      amount_type        = 'Cost of Advertising'      ← chữ "Advertising" Ở ĐÂY
+      amount_description = 'TransactionTotalAmount'   ← KHÔNG chứa "advertis"
+
+  ⇒ Có ad spend TỔNG mà KHÔNG cần Advertising API.
+
+  NHƯNG: **0 dòng ad spend có SKU.** Cả storage (−$1,850) và cước quốc tế
+  (−$8,446) cũng vậy. Phân bổ chúng xuống SKU theo doanh thu = BỊA. SKU chạy
+  ads nhiều sẽ bị gánh ít, SKU organic bị gánh oan → sai ngược chiều với quyết
+  định thật (tắt/bật ads SKU nào).
+
+  ⇒ Kiến trúc: fact = SKU grain, KHÔNG có ads/storage (tên cột nói rõ điều đó).
+              mart này = CHANNEL grain, CÓ ads/storage — con số THẬT.
+
+  ⚠️ KHOẢN QUAN TRỌNG NHẤT CỦA CẢ PIPELINE:
+     Ad spend ăn ~79% CM1. Kênh Amazon chỉ có lãi nhờ ORGANIC; phần trả phí là
+     ÂM RÒNG. Mọi báo cáo AFW KHÔNG đọc bảng này đều THỔI PHỒNG lợi nhuận kênh.
+
+  ⚠️ BẪY RESERVE — đã loại ở tầng taxonomy (cost_group='EXCLUDED'):
+     'Previous Reserve Amount Balance' +$118,227 / 'Current Reserve Amount'
+     −$59,876 = tiền Amazon TẠM GIỮ. Chỉ là dòng tiền, KHÔNG phải chi phí.
+     Cộng vào P&L → sai lệch hàng trăm nghìn đô. Cột `excluded_amount` dưới đây
+     giữ lại CHỈ để đối soát payout, TUYỆT ĐỐI không đưa vào margin.
+  ═══════════════════════════════════════════════════════════════════════════
+*/
+
+WITH
+-- ── Doanh thu + phí CẤP SKU (từ fact) ────────────────────────────────────────
+sku_level AS (
+  SELECT
+    DATE_TRUNC(day, MONTH)                  AS month,
+    brand,
+    channel,
+    SUM(units_sold)                         AS units_sold,
+    SUM(units_returned)                     AS units_returned,
+    SUM(gross_revenue)                      AS gross_revenue,
+    SUM(shipping_revenue)                   AS shipping_revenue,
+    SUM(promotion_discount)                 AS promotion_discount,
+    -- Phí cấp SKU — settlement trả SỐ ÂM, giữ nguyên dấu (cộng thẳng vào margin).
+    SUM(commission_fee)                     AS commission_fee,
+    SUM(fba_fulfillment_fee)                AS fba_fulfillment_fee,
+    SUM(other_fees)                         AS other_fees,
+    SUM(refund_amount)                      AS refund_amount,
+    SUM(safet_reimbursement)                AS safet_reimbursement,
+    SUM(return_label_cost)                  AS return_label_cost,
+    COUNT(DISTINCT sku)                     AS active_sku_count
+  FROM ${ref("fact_sku_pnl_daily")}
+  GROUP BY 1, 2, 3
+),
+
+-- ── Phí CẤP TÀI KHOẢN (từ settlement_fees — sku IS NULL) ─────────────────────
+--
+-- ⚠️ LỆCH KỲ: Amazon post phí tháng M vào settlement tháng M+1. `mart_sku_storage
+--    _allocated` ĐÃ map ngược bằng DATE_SUB(..., INTERVAL 1 MONTH) cho storage.
+--    Ở đây CỐ Ý DÙNG `posted_date` NGUYÊN BẢN (góc nhìn DÒNG TIỀN, khớp payout).
+--    ⚠️ VERIFY với Finance: muốn góc nhìn ACCRUAL (khớp kỳ phát sinh) thì phải
+--    map ngược — nhưng lệch kỳ KHÔNG đồng nhất giữa các loại phí (ads gần như
+--    real-time, storage trễ 1 tháng). ĐỪNG shift đồng loạt.
+account_level AS (
+  SELECT
+    DATE_TRUNC(posted_date, MONTH)                                        AS month,
+    brand,
+    'Amazon'                                                              AS channel,
+
+    -- MARKETING — ad spend + coupon + Vine. KHOẢN CHI LỚN NHẤT.
+    SUM(IF(cost_group = 'MARKETING', amount, 0))                          AS marketing_cost,
+    SUM(IF(amount_type IN ('Cost of Advertising', 'Refund for Advertiser'),
+           amount, 0))                                                    AS ad_spend,
+    SUM(IF(cost_group = 'MARKETING'
+           AND amount_type NOT IN ('Cost of Advertising', 'Refund for Advertiser'),
+           amount, 0))                                                    AS coupon_and_vine_cost,
+
+    -- LOGISTICS — tách ra vì đây là NGUỒN cho Cost Allocation Engine.
+    SUM(IF(cost_group = 'LOGISTICS', amount, 0))                          AS logistics_cost,
+    SUM(IF(cost_group = 'LOGISTICS'
+           AND LOWER(amount_description) LIKE '%storage%', amount, 0))    AS storage_cost,
+    SUM(IF(cost_group = 'LOGISTICS'
+           AND LOWER(amount_description) LIKE '%international freight%',
+           amount, 0))                                                    AS intl_freight_cost,
+    SUM(IF(cost_group = 'LOGISTICS'
+           AND LOWER(amount_description) LIKE '%placement%', amount, 0))  AS inbound_placement_cost,
+    SUM(IF(cost_group = 'LOGISTICS'
+           AND LOWER(amount_description) LIKE '%removal%', amount, 0))    AS removal_cost,
+
+    SUM(IF(cost_group = 'RETURNS', amount, 0))                            AS returns_cost,
+    SUM(IF(cost_group = 'TAX',     amount, 0))                            AS tax_cost,
+
+    -- ⚠️ CHỈ ĐỂ ĐỐI SOÁT PAYOUT — KHÔNG BAO GIỜ đưa vào margin (bẫy Reserve).
+    SUM(IF(cost_group = 'EXCLUDED', amount, 0))                           AS excluded_amount,
+
+    -- 🚨 CỜ ĐỎ: Amazon thêm loại phí mới → rơi vào UNMAPPED → BIẾN MẤT KHỎI P&L.
+    --    Kỳ vọng: 0 dòng, $0. Assertion assert_settlement_fees_no_unmapped canh cái này.
+    SUM(IF(cost_group = 'UNMAPPED', amount, 0))                           AS unmapped_amount,
+    COUNTIF(cost_group = 'UNMAPPED')                                      AS unmapped_row_count
+
+  FROM ${ref("master_amazon_settlement_fees")}
+  WHERE brand = 'AFW'
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  COALESCE(s.month, a.month)                                  AS month,
+  COALESCE(s.brand, a.brand)                                  AS brand,
+  COALESCE(s.channel, a.channel)                              AS channel,
+
+  -- ── Khối lượng
+  COALESCE(s.units_sold, 0)                                   AS units_sold,
+  COALESCE(s.units_returned, 0)                               AS units_returned,
+  SAFE_DIVIDE(s.units_returned, NULLIF(s.units_sold, 0)) * 100 AS return_rate_pct,
+  COALESCE(s.active_sku_count, 0)                             AS active_sku_count,
+
+  -- ── Doanh thu
+  COALESCE(s.gross_revenue, 0)                                AS gross_revenue,
+  COALESCE(s.shipping_revenue, 0)                             AS shipping_revenue,
+  COALESCE(s.promotion_discount, 0)                           AS promotion_discount,
+  COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0) AS net_revenue,
+
+  -- ── Phí cấp SKU (số ÂM)
+  COALESCE(s.commission_fee, 0)                               AS commission_fee,
+  COALESCE(s.fba_fulfillment_fee, 0)                          AS fba_fulfillment_fee,
+  COALESCE(s.other_fees, 0)                                   AS other_fees,
+  COALESCE(s.refund_amount, 0)                                AS refund_amount,
+  COALESCE(s.safet_reimbursement, 0)                          AS safet_reimbursement,
+  COALESCE(s.return_label_cost, 0)                            AS return_label_cost,
+
+  -- ── Phí cấp TÀI KHOẢN (số ÂM) — CHỈ CÓ Ở BẢNG NÀY
+  COALESCE(a.ad_spend, 0)                                     AS ad_spend,
+  COALESCE(a.coupon_and_vine_cost, 0)                         AS coupon_and_vine_cost,
+  COALESCE(a.marketing_cost, 0)                               AS marketing_cost,
+  COALESCE(a.storage_cost, 0)                                 AS storage_cost,
+  COALESCE(a.intl_freight_cost, 0)                            AS intl_freight_cost,
+  COALESCE(a.inbound_placement_cost, 0)                       AS inbound_placement_cost,
+  COALESCE(a.removal_cost, 0)                                 AS removal_cost,
+  COALESCE(a.logistics_cost, 0)                               AS logistics_cost,
+  COALESCE(a.returns_cost, 0)                                 AS returns_cost,
+  COALESCE(a.tax_cost, 0)                                     AS tax_cost,
+
+  /* ── CM1: doanh thu − phí SKU. CHƯA trừ ads/storage/freight ──
+     Đây là con số các báo cáo AFW hiện tại đang dùng. GIỮ LẠI để so sánh, và để
+     nhìn thấy TẬN MẮT ads ăn bao nhiêu phần trăm của nó. */
+  (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+    + COALESCE(s.commission_fee, 0)          -- đã âm
+    + COALESCE(s.fba_fulfillment_fee, 0)     -- đã âm
+    + COALESCE(s.other_fees, 0)
+    + COALESCE(s.safet_reimbursement, 0)
+    - COALESCE(s.return_label_cost, 0))                       AS cm1_pre_ads,
+
+  /* ── CM2: CM1 − ads − logistics − returns − tax. CON SỐ THẬT của kênh.
+     Vẫn CHƯA trừ COGS (Nhà Máy 5 — chưa có nguồn). */
+  (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+    + COALESCE(s.commission_fee, 0)
+    + COALESCE(s.fba_fulfillment_fee, 0)
+    + COALESCE(s.other_fees, 0)
+    + COALESCE(s.safet_reimbursement, 0)
+    - COALESCE(s.return_label_cost, 0)
+    + COALESCE(a.marketing_cost, 0)          -- đã âm
+    + COALESCE(a.logistics_cost, 0)          -- đã âm
+    + COALESCE(a.returns_cost, 0)
+    + COALESCE(a.tax_cost, 0))                                AS cm2_post_ads_pre_cogs,
+
+  -- 🎯 CHỈ SỐ QUAN TRỌNG NHẤT: ad spend ăn bao nhiêu % CM1.
+  --    Kỳ vọng ~79% theo phát hiện nghiệp vụ. > 100% ⇒ kênh LỖ ở phần trả phí.
+  ROUND(SAFE_DIVIDE(ABS(COALESCE(a.ad_spend, 0)),
+        NULLIF((COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+                + COALESCE(s.commission_fee, 0) + COALESCE(s.fba_fulfillment_fee, 0)
+                + COALESCE(s.other_fees, 0) + COALESCE(s.safet_reimbursement, 0)
+                - COALESCE(s.return_label_cost, 0)), 0)) * 100, 1)
+                                                              AS ad_spend_pct_of_cm1,
+
+  ROUND(SAFE_DIVIDE(ABS(COALESCE(a.ad_spend, 0)),
+        NULLIF(COALESCE(s.gross_revenue, 0), 0)) * 100, 2)    AS acos_pct,  -- ad spend / doanh thu
+
+  -- ── Đối soát & cờ đỏ
+  COALESCE(a.excluded_amount, 0)                              AS excluded_amount,   -- KHÔNG dùng cho margin
+  COALESCE(a.unmapped_amount, 0)                              AS unmapped_amount,   -- phải = 0
+  COALESCE(a.unmapped_row_count, 0)                           AS unmapped_row_count,-- phải = 0
+  IF(COALESCE(a.unmapped_row_count, 0) > 0,
+     '🚨 Amazon có loại phí MỚI chưa map — đang BIẾN MẤT khỏi P&L. Sửa taxonomy ở stg_amazon_settlement_fees.',
+     'OK')                                                    AS taxonomy_health,
+
+  CURRENT_TIMESTAMP()                                         AS _generated_at
+
+FROM sku_level s
+FULL OUTER JOIN account_level a
+  ON  s.month   = a.month
+  AND s.brand   = a.brand
+  AND s.channel = a.channel

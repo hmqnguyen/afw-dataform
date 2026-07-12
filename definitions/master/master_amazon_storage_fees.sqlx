@@ -1,6 +1,10 @@
 config {
   type: "table",
   schema: dataform.projectConfig.vars.master_dataset,
+  assertions: {
+    uniqueKey: ["month_of_charge", "asin", "fnsku", "fulfillment_center"],
+    nonNull: ["month_of_charge", "asin"]
+  },
   description: "Master — phí lưu kho per-ASIN. GIỮ TOÀN BỘ LỊCH SỬ (mọi month_of_charge) + cột is_latest. Truy xuất 'hiện tại': WHERE is_latest (không cần MAX(month_of_charge)). Mart/fact đọc bảng NÀY (invariant I1: mart/fact CHỈ đọc master).",
   tags: ["master", "amazon", "storage_fees"],
   bigquery: { partitionBy: "month_of_charge", clusterBy: ["asin"] }

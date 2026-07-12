@@ -1,14 +1,17 @@
 config {
   type: "incremental",
   schema: dataform.projectConfig.vars.staging_dataset,
-  uniqueKey: ["settlement_id", "amazon_order_id", "sku", "amount_type", "amount_description", "amount", "posted_date_time"],
-  description: "Staging settlement — parse JSON V2 + xử lý local currency + dedupe 7 cột composite key, gộp trong 1 bước. Không lưu raw_payload/metadata.",
+  assertions: {
+    uniqueKey: ["settlement_key"],
+    nonNull: ["settlement_key", "settlement_id", "posted_date"]
+  },
+  uniqueKey: ["settlement_key"],
+  description: "Staging settlement — parse JSON V2 + xử lý local currency + dedupe theo settlement_key (hash NULL-SAFE của 7 cột). F5 fix 2026-07-12: khoá composite cũ dùng amazon_order_id trực tiếp trong MERGE ON → dòng adjustment/reimbursement có order-id NULL không bao giờ match → INSERT lại mỗi lần chạy → phình trùng. Không lưu raw_payload/metadata.",
   tags: ["staging", "amazon", "settlement"],
   bigquery: {
     partitionBy: "posted_date",
     clusterBy: ["sku", "amount_type"]
   }
-
 }
 
 pre_operations {
@@ -23,14 +26,42 @@ pre_operations {
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F5 — TẠI SAO PHẢI CÓ settlement_key (đọc trước khi sửa file này)
+
+   Khoá cũ (7 cột composite, đặt thẳng vào config.uniqueKey):
+       settlement_id, amazon_order_id, sku, amount_type,
+       amount_description, amount, posted_date_time
+
+   Dataform sinh MERGE từ uniqueKey:
+       MERGE T USING (S) ON T.settlement_id   = S.settlement_id
+                        AND T.amazon_order_id = S.amazon_order_id   ← 💥
+                        AND ...
+
+   `amazon_order_id` CÓ THỂ NULL. Staging chỉ lọc `sku IS NOT NULL` —
+   dòng ADJUSTMENT / REIMBURSEMENT có `sku` + `adjustment-id` nhưng
+   KHÔNG có `order-id`. Đây chính là những dòng mà §8 muốn wire vào P&L.
+
+   SQL: NULL = NULL  →  UNKNOWN  →  KHÔNG match  →  WHEN NOT MATCHED
+        → INSERT LẠI MỖI LẦN CHẠY → phình trùng vô hạn.
+
+   Cùng bug này đã được giải đúng ở stg_amazon_settlement_fees bằng `fee_key`.
+   Đây là cùng pattern, đặt cùng tên hệ: settlement_key.
+
+   ⇒ Hash NULL-safe: mọi thành phần bọc COALESCE(..., '~NULL~').
+     Sentinel '~NULL~' chọn vì KHÔNG BAO GIỜ xuất hiện trong định danh
+     Amazon (SKU/order-id/amount-description). Chuỗi rỗng '' KHÔNG dùng được
+     làm sentinel vì amount_description RỖNG là giá trị THẬT (dòng header).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+
 -- INCREMENTAL + WATERMARK trên _ingested_at:
 --   • Chạy thường: CHỈ quét raw MỚI (_ingested_at > watermark) → không quét lại
 --     toàn bộ lịch sử raw (raw append-only, phình dần theo thời gian).
 --   • Dedup 2 tầng: (a) ROW_NUMBER khử trùng TRONG batch mới; (b) Dataform MERGE
---     theo uniqueKey khử trùng XUYÊN batch — bản mới ghi đè bản cũ (latest-wins
---     giữ nguyên, vì raw mới luôn có _ingested_at lớn hơn).
+--     theo settlement_key khử trùng XUYÊN batch — bản mới ghi đè bản cũ.
 --   • Sửa logic staging / nạp raw cũ (backfill) → chạy `dataform run --full-refresh`
---     (bỏ qua watermark, rebuild toàn bộ). Chunk chồng biên vẫn an toàn nhờ MERGE.
+--     ⚠️ NHƯNG XEM sql/backup_before_full_refresh.sql TRƯỚC (raw chỉ giữ 90 ngày).
 
 WITH parsed AS (
   SELECT
@@ -61,8 +92,7 @@ WITH parsed AS (
     -- Số tiền (xử lý local currency format)
     -- LƯU Ý: currency có thể là "" (rỗng) trong thực tế — ví dụ dòng phí
     -- nội bộ Amazon (amount-type="Cost of Advertising") không gắn
-    -- marketplace cụ thể. Coi currency rỗng/NULL là USD (an toàn, không
-    -- chạy nhánh xử lý local currency phức tạp không cần thiết).
+    -- marketplace cụ thể. Coi currency rỗng/NULL là USD.
     JSON_VALUE(raw_payload, '$.currency')                     AS currency_code,
 
     SAFE_CAST(
@@ -86,9 +116,8 @@ WITH parsed AS (
     -- Thời gian
     -- SAFE.PARSE_DATE — bắt buộc dùng SAFE vì raw_payload thực tế có thể
     -- chứa chuỗi rỗng "" cho các field ngày này (ví dụ dòng amount-type=
-    -- "Cost of Advertising" có settlement-start-date/settlement-end-date
-    -- đều rỗng). PARSE_DATE thường (không SAFE) sẽ FAIL CỨNG toàn bộ query
-    -- với "Failed to parse input string \"\"" — đã xác nhận qua lỗi thật.
+    -- "Cost of Advertising" có settlement-start-date/end-date đều rỗng).
+    -- PARSE_DATE thường sẽ FAIL CỨNG toàn bộ query — đã xác nhận qua lỗi thật.
     SAFE.PARSE_DATE('%Y-%m-%d',
       SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10))
                                                               AS settlement_start_date,
@@ -130,25 +159,36 @@ enriched AS (
   WINDOW w AS (PARTITION BY settlement_id)
 ),
 
+-- 🔴 F5 FIX — khoá dedup NULL-SAFE, tính MỘT LẦN, dùng cho cả ROW_NUMBER,
+-- Dataform MERGE ON, và assertion. Cùng pattern với fee_key ở settlement_fees.
+keyed AS (
+  SELECT
+    *,
+    TO_HEX(MD5(ARRAY_TO_STRING([
+      COALESCE(settlement_id,                      '~NULL~'),
+      COALESCE(amazon_order_id,                    '~NULL~'),   -- ← NULL ở dòng adjustment
+      COALESCE(sku,                                '~NULL~'),
+      COALESCE(amount_type,                        '~NULL~'),
+      COALESCE(amount_description,                 '~NULL~'),   -- '' là giá trị THẬT ≠ NULL
+      COALESCE(CAST(amount AS STRING),             '~NULL~'),   -- NUMERIC → STRING: ổn định, không phụ thuộc float
+      COALESCE(CAST(posted_date_time AS STRING),   '~NULL~')
+    ], '|'))) AS settlement_key
+  FROM enriched
+  WHERE sku IS NOT NULL AND sku != ''
+),
+
 ranked AS (
   SELECT
     *,
     ROW_NUMBER() OVER (
-      PARTITION BY
-        settlement_id,
-        amazon_order_id,
-        sku,
-        amount_type,
-        amount_description,
-        CAST(amount AS STRING),
-        posted_date_time
+      PARTITION BY settlement_key
       ORDER BY _ingested_at DESC
     ) AS rn
-  FROM enriched
-  WHERE sku IS NOT NULL AND sku != ''
+  FROM keyed
 )
 
 SELECT
+  settlement_key,               -- ← khoá dedup (cột ĐẦU: master + assertion đều tham chiếu)
   brand,
   settlement_id,
   amazon_order_id,
@@ -173,6 +213,7 @@ SELECT
   settlement_end_date,
   posted_date,
   posted_date_time,
-  deposit_date
+  deposit_date,
+  _ingested_at                  -- ← master cần cột này để dedup/watermark
 FROM ranked
 WHERE rn = 1
