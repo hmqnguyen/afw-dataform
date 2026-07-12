@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   name: "master_amazon_sales_traffic_by_asin",
-  description: "Master Sales & Traffic cấp SKU. Grain: report_date × sku (G1: payload KHÔNG có field date → 1 report / 1 ngày là BẮT BUỘC). Nguồn cho mart_amazon_traffic_conversion + mart_amazon_buybox_daily. F6 fix 2026-07-12: filter incremental đổi từ cửa sổ report_date 35 ngày sang WATERMARK _ingested_at.",
+  description: "Master Sales & Traffic cấp SKU. Grain: report_date × sku (G1: payload KHÔNG có field date → 1 report / 1 ngày là BẮT BUỘC). Nguồn cho mart_amazon_traffic_conversion + mart_amazon_buybox_daily. F6 + F14 fix 2026-07-12.",
   tags: ["amazon", "sales_traffic", "master"],
   uniqueKey: ["dedup_key"],
   bigquery: {
@@ -18,30 +18,48 @@ config {
 /* ═══════════════════════════════════════════════════════════════════════════
    🔴 F6 — TẠI SAO BỎ `WHERE report_date >= DATE_SUB(CURRENT_DATE(), 35 DAY)`
 
-   Filter CŨ lọc theo NGÀY BÁO CÁO. Nhưng backfill/vá thủng nạp data có
+   Filter CŨ lọc theo NGÀY BÁO CÁO. Nhưng backfill / vá thủng nạp data có
    report_date CŨ vào lúc HIỆN TẠI. Hai chiều thời gian này KHÔNG trùng nhau.
 
-   Ví dụ thật — §7 bước 4 bảo vá 3 ngày thủng (hôm nay 2026-07-12):
+   Ví dụ thật — vá 3 ngày thủng (hôm nay 2026-07-12):
        2026-04-16  → 87 ngày trước  → ❌ BỊ LỌC BỎ, không vào master
        2026-05-10  → 63 ngày trước  → ❌ BỊ LỌC BỎ, không vào master
        2026-07-02  → 10 ngày trước  → ✅ vào được
 
-   Anh chạy SalesTrafficSync, thấy raw có, staging có → tưởng xong. Master vẫn
-   thủng 2 ngày. Và assert_no_date_gaps đọc STAGING (không phải master) nên
-   CŨNG KHÔNG BÁO. Thủng âm thầm — đúng loại lỗi mà FailureTracker sinh ra để
-   diệt, nhưng lại tái xuất hiện ở tầng transform.
+   Chạy SalesTrafficSync, thấy raw có, staging có → tưởng xong. Master vẫn thủng
+   2 ngày. Và assert_no_date_gaps đọc STAGING (không phải master) nên CŨNG KHÔNG
+   BÁO. Thủng âm thầm.
 
-   Filter MỚI (Q3) = WATERMARK trên _ingested_at, giống hệt 12 staging:
+   Filter MỚI = WATERMARK trên _ingested_at, giống hệt 12 staging:
        "nạp mọi dòng MỚI ĐƯỢC GHI kể từ lần chạy trước"
    → report_date cũ tới đâu cũng vào được. Backfill 546 ngày cũng vào được.
-   → Đồng thời loại được rủi ro Amazon RESTATE (G4): bản restate có
-     _ingested_at mới hơn → luôn lọt watermark → MERGE theo dedup_key ghi đè
-     bản cũ. Cửa sổ 35 ngày cũ chỉ TÌNH CỜ che được ca này.
+   → Đồng thời xử lý đúng Amazon RESTATE (G4): bản restate có _ingested_at mới
+     hơn → luôn lọt watermark → MERGE theo dedup_key ghi đè bản cũ. Cửa sổ 35
+     ngày cũ chỉ TÌNH CỜ che được ca này.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 pre_operations {
-  -- (1) Bảng phải tồn tại trước khi ${self()} được tham chiếu trong watermark.
-  --     ⚠️ SCHEMA PHẢI KHỚP CHÍNH XÁC với câu SELECT (stg_* + _loaded_at).
+  /* 🔴 F14 (2026-07-12) — BigQuery: "Variable declarations are allowed only at
+     the start of a block or script."
+
+     Bản trước đặt CREATE TABLE IF NOT EXISTS TRƯỚC rồi mới DECLARE → LỖI CỨNG.
+     Nhưng đảo ngược đơn thuần cũng hỏng: DECLARE ... DEFAULT (SELECT MAX(...)
+     FROM ${self()}) cần bảng ĐÃ TỒN TẠI. Con gà / quả trứng.
+
+     ⇒ 3 bước, đúng thứ tự BigQuery cho phép:
+        (1) DECLARE với HẰNG SỐ        — hợp lệ ở đầu block, không đụng ${self()}
+        (2) CREATE TABLE IF NOT EXISTS — bảo đảm ${self()} tồn tại
+        (3) SET từ ${self()}           — lúc này bảng chắc chắn có
+
+     Full-refresh: when(incremental()) = false → bước (3) KHÔNG sinh ra →
+     checkpoint giữ 1970 → rebuild toàn bộ. Đúng ý đồ. */
+
+  -- (1) PHẢI là câu lệnh ĐẦU TIÊN của block.
+  DECLARE ingested_at_checkpoint TIMESTAMP DEFAULT TIMESTAMP('1970-01-01');
+
+  -- (2) Bảo đảm ${self()} tồn tại trước bước (3) và trước câu SELECT chính
+  --     (edge-case: incremental() = true trong khi bảng chưa từng được tạo).
+  --     ⚠️ SCHEMA PHẢI KHỚP CHÍNH XÁC câu SELECT (staging + _loaded_at).
   CREATE TABLE IF NOT EXISTS ${self()} (
     report_date           DATE,
     report_id             STRING,
@@ -68,14 +86,13 @@ pre_operations {
   PARTITION BY report_date
   CLUSTER BY sku, child_asin;
 
-  -- (2) 🔴 F6 — WATERMARK. Dùng BIẾN, không subquery inline: BigQuery coi biến
-  --     là hằng số nên PRUNE được partition của staging; subquery inline trong
-  --     WHERE sẽ full-scan.
-  DECLARE ingested_at_checkpoint DEFAULT (
-    ${when(incremental(),
-      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
-      `SELECT TIMESTAMP('1970-01-01')`)}
-  )
+  -- (3) 🔴 F6 — WATERMARK. Bảng đã tồn tại → an toàn đọc ${self()}.
+  --     Dùng BIẾN (không subquery inline trong WHERE): BigQuery coi biến là hằng
+  --     số nên PRUNE được partition của staging; subquery inline sẽ full-scan.
+  ${when(incremental(),
+    `SET ingested_at_checkpoint = (
+       SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}
+     );`)}
 }
 
 SELECT

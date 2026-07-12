@@ -2,7 +2,7 @@ config {
   type: "incremental",
   schema: dataform.projectConfig.vars.master_dataset,
   name: "master_amazon_sales_traffic_by_date",
-  description: "Master Sales & Traffic cấp KÊNH (1 dòng/ngày). Latest-state theo report_date. F3b + F6 fix 2026-07-12: pre_operations thiếu cột _ingested_at (schema mismatch → MERGE INSERT fail); filter incremental đổi từ cửa sổ report_date 35 ngày sang watermark _ingested_at.",
+  description: "Master Sales & Traffic cấp KÊNH (1 dòng/ngày). Latest-state theo report_date. F3b + F6 + F14 fix 2026-07-12.",
   tags: ["amazon", "sales_traffic", "master"],
   uniqueKey: ["report_date"],
   bigquery: {
@@ -18,22 +18,34 @@ config {
 /* ═══════════════════════════════════════════════════════════════════════════
    🔴 F3b — pre_operations CŨ tạo bảng 21 cột, KHÔNG có `_ingested_at`.
    Nhưng stg_amazon_sales_traffic_by_date trả về 22 cột, cột CUỐI là
-   `_ingested_at` (dòng 74 của file staging). ⇒ MERGE ... WHEN NOT MATCHED
-   THEN INSERT ROW ném "Column _ingested_at is not present in table".
-   Cùng lớp lỗi với F3 ở master_amazon_orders.
+   `_ingested_at`. ⇒ MERGE ... WHEN NOT MATCHED THEN INSERT ROW ném
+   "Column _ingested_at is not present in table". Cùng lớp lỗi với F3 ở
+   master_amazon_orders (thiếu purchase_order_number / gift_wrap_tax /
+   promotion_ids).
 
-   Lỗi này còn nghiêm trọng hơn sau khi chọn Q3: WATERMARK _ingested_at
-   CẦN CHÍNH CỘT NÀY tồn tại trong master. Không có cột → watermark vô nghĩa.
+   Nghiêm trọng hơn sau khi chọn watermark: WATERMARK CẦN CHÍNH CỘT NÀY.
 
    🔴 F6 — filter incremental: cửa sổ `report_date >= CURRENT_DATE - 35` chặn
-   mọi backfill/vá thủng có report_date cũ. Xem giải thích đầy đủ ở
+   mọi backfill / vá thủng có report_date cũ. Xem giải thích đầy đủ ở
    master_amazon_sales_traffic_by_asin.sqlx.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 pre_operations {
-  -- (1) Bảng phải tồn tại trước khi ${self()} được tham chiếu.
-  --     ⚠️ SCHEMA KHỚP CHÍNH XÁC 22 cột của staging + _loaded_at = 23 cột.
-  --     Thứ tự PHẢI khớp câu SELECT của staging (report_date → ... → _ingested_at).
+  /* 🔴 F14 (2026-07-12) — BigQuery: "Variable declarations are allowed only at
+     the start of a block or script."
+
+     Bản trước đặt CREATE TABLE IF NOT EXISTS TRƯỚC rồi mới DECLARE → LỖI CỨNG.
+     Nhưng đảo ngược đơn thuần cũng hỏng: DECLARE ... DEFAULT (SELECT MAX(...)
+     FROM ${self()}) cần bảng ĐÃ TỒN TẠI. Con gà / quả trứng.
+
+     ⇒ 3 bước: (1) DECLARE hằng số → (2) CREATE TABLE → (3) SET từ ${self()}.
+     Full-refresh: bước (3) không sinh ra → checkpoint giữ 1970 → rebuild toàn bộ. */
+
+  -- (1) PHẢI là câu lệnh ĐẦU TIÊN của block.
+  DECLARE ingested_at_checkpoint TIMESTAMP DEFAULT TIMESTAMP('1970-01-01');
+
+  -- (2) ⚠️ SCHEMA KHỚP CHÍNH XÁC 22 cột của staging + _loaded_at = 23 cột.
+  --     Thứ tự theo câu SELECT của staging (report_date → ... → _ingested_at).
   CREATE TABLE IF NOT EXISTS ${self()} (
     report_date               DATE,
     report_id                 STRING,
@@ -62,22 +74,21 @@ pre_operations {
   PARTITION BY report_date
   CLUSTER BY report_id;
 
-  -- (2) 🔴 F6 — WATERMARK (thay cửa sổ report_date 35 ngày).
-  DECLARE ingested_at_checkpoint DEFAULT (
-    ${when(incremental(),
-      `SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}`,
-      `SELECT TIMESTAMP('1970-01-01')`)}
-  )
+  -- (3) 🔴 F6 — WATERMARK. Bảng đã tồn tại → an toàn đọc ${self()}.
+  ${when(incremental(),
+    `SET ingested_at_checkpoint = (
+       SELECT COALESCE(MAX(_ingested_at), TIMESTAMP('1970-01-01')) FROM ${self()}
+     );`)}
 }
 
 -- G4 (Amazon RESTATE 2-3 ngày): bản restate luôn có _ingested_at MỚI HƠN →
--- luôn lọt watermark → MERGE theo uniqueKey=report_date GHI ĐÈ bản cũ.
--- Đây là latest-wins đúng nghĩa, không phụ thuộc cửa sổ ngày cố định.
+-- luôn lọt watermark → MERGE theo uniqueKey = report_date GHI ĐÈ bản cũ.
+-- Latest-wins đúng nghĩa, không phụ thuộc cửa sổ ngày cố định.
 --
 -- G6 (data lag = 2 ngày, KHÔNG phải 1): payload 2026-07-10 có
--- orderedProductSales=12989 nhưng sessions=0/pageViews=0/buyBox=0 — traffic
--- CHƯA VỀ. Chống ở tầng SERVICE (DataLagDays=2), không ở đây: nếu lọc ở đây
--- thì ngày lag sẽ không bao giờ được cập nhật lại khi traffic về sau.
+-- orderedProductSales = 12,989 nhưng sessions = 0 / pageViews = 0 / buyBox = 0
+-- — traffic CHƯA VỀ. Chống ở tầng SERVICE (DataLagDays = 2), KHÔNG ở đây: nếu
+-- lọc ở đây thì ngày lag sẽ không bao giờ được cập nhật lại khi traffic về sau.
 
 SELECT
   s.*,
