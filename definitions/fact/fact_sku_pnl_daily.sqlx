@@ -35,10 +35,36 @@ config {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 pre_operations {
-  -- Lookback 35 ngày: bắt kịp settlement post trễ + buffer nếu job fail vài ngày.
-  -- ⚠️ RÀNG BUỘC CỨNG với I2: raw retention = 90 ngày phải LỚN HƠN cửa sổ này.
-  --    Đừng nới 35 ngày lên gần 90 mà không nới retention raw trước.
-  DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+  /* ═══════════════════════════════════════════════════════════════════════
+     🔴 F16 (2026-07-12) — FULL-REFRESH ĐANG XOÁ LỊCH SỬ XUỐNG CÒN 35 NGÀY.
+
+     BẢN CŨ:
+         DECLARE target_date_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+     Hằng số này áp cho MỌI CTE nguồn (revenue_agg / fees_agg / returns_agg /
+     returns_money) — KỂ CẢ KHI FULL-REFRESH.
+
+     ⇒ `dataform run --full-refresh` dựng lại fact TỪ ĐẦU nhưng CHỈ lấy 35 ngày
+       → toàn bộ lịch sử cũ BIẾN MẤT. Bằng chứng chạy thật 2026-07-12:
+           fact_sku_pnl_daily: 2026-06-07 → 2026-07-09   (đúng 35 ngày)
+           mart_amazon_channel_pnl_monthly:
+               2026-04  cm1=0  ads=−27,375  → cm2=−30,572   ← KHÔNG PHẢI kênh lỗ
+               2026-05  cm1=0  ads=−35,384  → cm2=−46,074   ← mà là FACT TRỐNG
+       Ad spend có ở settlement (cấp tài khoản, không bị cắt), nhưng doanh thu
+       cấp SKU thì bị cắt ⇒ P&L kênh SAI HOÀN TOÀN ở mọi tháng > 35 ngày.
+
+     CỬA SỔ 35 NGÀY LÀ ĐỂ REPROCESS INCREMENTAL, KHÔNG PHẢI ĐỂ GIỚI HẠN
+     FULL-REFRESH. master_* giữ ĐỦ lịch sử — fact tự cắt mất là vô lý.
+
+     ⇒ VÁ: full-refresh → mốc 1970 (dựng TOÀN BỘ từ master).
+           incremental  → mốc 35 ngày (chỉ reprocess cửa sổ trễ settlement).
+
+     ⚠️ Đây là CÙNG LỚP với F2 (raw retention 90 ngày + full-refresh = mất data),
+        nhưng ở tầng FACT. Nguyên tắc chung: MỌI bộ lọc thời gian trong nhánh
+        incremental PHẢI bọc `when(incremental(), ...)`. Nếu nó chạy cả ở
+        full-refresh thì nó không phải "cửa sổ reprocess" — nó là "cắt lịch sử". */
+  DECLARE target_date_start DATE DEFAULT ${when(incremental(),
+    `DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)`,
+    `DATE '1970-01-01'`)}
 }
 
 -- LƯU Ý: Ads (ad_spend, ad_impressions, ad_clicks, ad_attributed_*) đã TÁCH
