@@ -1,0 +1,47 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  name: "assert_settlement_fees_fabricated_date",
+  description: "CỜ ĐỎ: một khoản chi THẬT (cost_group != 'EXCLUDED') đang bị gán NGÀY SUY DIỄN (posted_date_source='INGESTED_AT') → sai KỲ P&L. Chỉ dòng EXCLUDED mới được phép dùng fallback này.",
+  tags: ["assertion", "amazon", "settlement_fees"]
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════════════════
+  TẠI SAO ASSERTION NÀY TỒN TẠI (F13)
+
+  `posted_date` là PARTITION KEY. NULL → dồn vào partition __NULL__ → dòng đó
+  BIẾN MẤT khỏi mọi query lọc theo ngày. Nên staging có chuỗi fallback 7 tầng,
+  tầng cuối là DATE(_ingested_at) — NGÀY SUY DIỄN, không phải ngày Amazon post.
+
+  Data thật 2026-07-12: đúng 14 dòng phải dùng fallback cuối, và cả 14 đều là
+  cost_group='EXCLUDED' (Subscription Fee / Payable to Amazon / Successful
+  charge) → KHÔNG vào margin → ngày suy diễn ảnh hưởng P&L = 0. Chấp nhận được.
+
+  🚨 NHƯNG nếu một ngày Amazon post một khoản chi THẬT (MARKETING / LOGISTICS /
+  RETURNS / TAX) mà không kèm ngày → nó sẽ âm thầm nhận DATE(_ingested_at).
+  Ngày ingest KHÁC ngày phát sinh → khoản chi rơi SAI THÁNG → P&L sai kỳ, và
+  mart_amazon_channel_pnl_monthly quy sai tháng cho ad spend.
+
+  Assertion này biến ca đó thành lỗi ỒN ÀO thay vì sai âm thầm.
+
+  KHI FAIL — làm gì:
+    1. Xem dòng nào, cost_group gì, số tiền bao nhiêu.
+    2. Tìm nguồn ngày ĐÚNG trong raw_payload (Amazon có thể đã thêm field mới).
+    3. Chèn tầng fallback MỚI vào COALESCE của stg_amazon_settlement_fees —
+       ĐẶT TRƯỚC DATE(_ingested_at).
+    4. TUYỆT ĐỐI KHÔNG nới assertion này để cho qua.
+  ═══════════════════════════════════════════════════════════════════════════
+*/
+
+SELECT
+  fee_key,
+  posted_date,
+  posted_date_source,
+  cost_group,
+  amount_type,
+  amount_description,
+  amount
+FROM ${ref("stg_amazon_settlement_fees")}
+WHERE posted_date_source = 'INGESTED_AT'
+  AND cost_group != 'EXCLUDED'

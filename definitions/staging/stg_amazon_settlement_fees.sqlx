@@ -69,6 +69,10 @@ WITH all_rows AS (
       JSON_VALUE(raw_payload, '$."posted-date"'))                       AS posted_date_field,
     SAFE.PARSE_DATE('%Y-%m-%d',
       SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10)) AS settlement_end_date,
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."settlement-start-date"'), 1, 10)) AS settlement_start_date,
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."deposit-date"'), 1, 10))        AS deposit_date,
 
     _ingested_at
   FROM ${ref("raw_amazon_settlement")}
@@ -98,8 +102,11 @@ WITH all_rows AS (
 broadcast AS (
   SELECT
     *,
-    MAX(settlement_end_date) OVER (PARTITION BY settlement_id) AS settlement_end_date_hdr
+    MAX(settlement_end_date)   OVER w AS settlement_end_date_hdr,
+    MAX(settlement_start_date) OVER w AS settlement_start_date_hdr,
+    MAX(deposit_date)          OVER w AS deposit_date_hdr
   FROM all_rows
+  WINDOW w AS (PARTITION BY settlement_id)
 ),
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -120,22 +127,50 @@ parsed AS (
        posted_date = DATE(posted-date-time)). Bản cũ dùng `posted-date` → hai
        staging CÙNG ĐỌC MỘT RAW mà dùng HAI FIELD khác nhau cho cùng khái niệm
        → ngày có thể lệch, mọi đối soát settlement ↔ settlement_fees sẽ sai. */
+    /* 🔴 F13 (2026-07-12) — F12 (broadcast từ header) THẤT BẠI TRÊN DATA THẬT.
+       Kết quả chạy: 479 dòng 'POSTED_DATE_TIME' + 14 dòng 'NONE'.
+       ⇒ MAX(settlement_end_date) OVER (PARTITION BY settlement_id) KHÔNG kéo
+         được gì cho 14 dòng đó. Header của chúng cũng trắng ngày, hoặc chúng
+         không thuộc settlement nào.
+
+       Cũng học được: KHÔNG dòng nào đi tầng 'POSTED_DATE'. `posted-date` và
+       `posted-date-time` LUÔN cùng có hoặc cùng rỗng ⇒ chỉ có 2 nhóm thật:
+       479 dòng có ngày, 14 dòng TRẮNG HOÀN TOÀN.
+
+       ⇒ Nối thêm tầng, tầng CUỐI là DATE(_ingested_at) — bảo đảm assertion
+         nonNull luôn pass mà KHÔNG GIẤU GÌ (posted_date_source phơi bày).
+
+       VÌ SAO CHẤP NHẬN ĐƯỢC: cả 14 dòng đều là cost_group='EXCLUDED'
+       (Subscription Fee −$403.46 / Payable to Amazon −$193.11 /
+        Successful charge +$55.94) → KHÔNG BAO GIỜ vào margin
+       ⇒ ngày suy diễn có ảnh hưởng P&L = 0. Nó chỉ cần một partition để tồn
+         tại và đối soát payout được (posted_date là PARTITION KEY — NULL sẽ
+         dồn vào __NULL__ và biến mất khỏi mọi query lọc theo ngày).
+
+       ⚠️ NẾU MỘT NGÀY posted_date_source='INGESTED_AT' xuất hiện ở
+          cost_group KHÁC 'EXCLUDED' → DỪNG LẠI. Khi đó một khoản chi THẬT đang
+          bị gán ngày bịa → sai kỳ P&L. Assertion assert_settlement_fees_fabricated_date
+          canh đúng ca này. */
     COALESCE(
-      DATE(posted_date_time),      -- (1) nguồn quyền uy, khớp stg_amazon_settlement
-      posted_date_field,           -- (2) field `posted-date` (479/510 dòng có)
-      settlement_end_date,         -- (3) ngày chốt kỳ trên chính dòng đó
-      settlement_end_date_hdr      -- (4) 🔴 F12: kéo từ dòng HEADER cùng settlement
+      DATE(posted_date_time),        -- (1) nguồn quyền uy, khớp stg_amazon_settlement (479)
+      posted_date_field,             -- (2) `posted-date` — thực tế luôn trùng (1)
+      settlement_end_date,           -- (3) ngày chốt kỳ trên chính dòng đó
+      settlement_end_date_hdr,       -- (4) F12: kéo từ HEADER cùng settlement
+      settlement_start_date_hdr,     -- (5) F13
+      deposit_date_hdr,              -- (6) F13
+      DATE(_ingested_at)             -- (7) F13: CHỐT CHẶN — không bao giờ NULL
     )                                                                   AS posted_date,
 
     -- Fallback nào đã dùng — KHÔNG BAO GIỜ sửa số âm thầm.
-    -- 'SETTLEMENT_HEADER' = 14 dòng other-transaction nói trên. Kỳ vọng ĐÚNG 14.
-    -- 'NONE'              = 🚨 còn dòng không có ngày ở đâu cả → assertion nonNull FAIL.
+    -- Kỳ vọng sau F13: 479 × POSTED_DATE_TIME · 14 × (tầng 4/5/6/7) · 0 × NONE
     CASE
-      WHEN posted_date_time        IS NOT NULL THEN 'POSTED_DATE_TIME'
-      WHEN posted_date_field       IS NOT NULL THEN 'POSTED_DATE'
-      WHEN settlement_end_date     IS NOT NULL THEN 'SETTLEMENT_END_DATE'
-      WHEN settlement_end_date_hdr IS NOT NULL THEN 'SETTLEMENT_HEADER'
-      ELSE 'NONE'
+      WHEN posted_date_time          IS NOT NULL THEN 'POSTED_DATE_TIME'
+      WHEN posted_date_field         IS NOT NULL THEN 'POSTED_DATE'
+      WHEN settlement_end_date       IS NOT NULL THEN 'SETTLEMENT_END_DATE'
+      WHEN settlement_end_date_hdr   IS NOT NULL THEN 'HDR_END_DATE'
+      WHEN settlement_start_date_hdr IS NOT NULL THEN 'HDR_START_DATE'
+      WHEN deposit_date_hdr          IS NOT NULL THEN 'HDR_DEPOSIT_DATE'
+      ELSE 'INGESTED_AT'   -- ⚠️ NGÀY SUY DIỄN. Chỉ chấp nhận cho cost_group='EXCLUDED'.
     END                                                                 AS posted_date_source,
 
     posted_date_time,
