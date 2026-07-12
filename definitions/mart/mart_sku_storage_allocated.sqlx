@@ -75,19 +75,58 @@ driver_total AS (
   FROM sku_driver GROUP BY usage_month
 ),
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F15 (2026-07-12) — BigQuery: "Correlated subqueries that reference other
+   tables are not supported unless they can be de-correlated."
+
+   BẢN CŨ lấy "TB 3 tháng ACTUAL gần nhất TRƯỚC tháng t" bằng subquery TƯƠNG QUAN:
+       (SELECT AVG(...) FROM (SELECT ... FROM actual_by_month a2
+                              WHERE a2.usage_month < t.usage_month   ← TƯƠNG QUAN
+                              ORDER BY ... LIMIT 3) a3)              ← + LIMIT
+   Tương quan + LIMIT ⇒ BigQuery KHÔNG de-correlate được → LỖI CỨNG.
+
+   BẢN MỚI: JOIN + ROW_NUMBER — NGỮ NGHĨA GIỐNG HỆT, và de-correlate được.
+     • JOIN mọi cặp (tháng cần tính t, tháng actual đứng TRƯỚC nó)
+     • ROW_NUMBER xếp actual theo thời gian giảm dần
+     • giữ rn <= 3 → đúng "3 actual GẦN NHẤT trước tháng t"
+
+   ⚠️ Là "3 tháng ACTUAL gần nhất", KHÔNG phải "3 tháng LỊCH gần nhất". Tháng
+      thiếu settlement bị BỎ QUA, không tính là 0 — đúng ý đồ kế toán.
+      Đây chính là lý do KHÔNG dùng được window `ROWS BETWEEN 3 PRECEDING AND
+      1 PRECEDING`: window đếm theo DÒNG, kể cả dòng không có actual → sẽ pha
+      loãng trung bình bằng NULL/0.
+
+   Cardinality: tháng × tháng — vài chục dòng. Chi phí bằng 0.
+   ═══════════════════════════════════════════════════════════════════════════ */
+actual_pairs AS (
+  SELECT
+    t.usage_month,
+    a.storage_actual_total,
+    ROW_NUMBER() OVER (
+      PARTITION BY t.usage_month
+      ORDER BY a.usage_month DESC
+    ) AS rn
+  FROM driver_total t
+  JOIN actual_by_month a
+    ON a.usage_month < t.usage_month          -- CHỈ tháng ACTUAL ĐỨNG TRƯỚC t
+),
+
+avg_last_3 AS (
+  SELECT
+    usage_month,
+    AVG(storage_actual_total) AS avg_last_3_actual
+  FROM actual_pairs
+  WHERE rn <= 3                                -- 3 tháng actual gần nhất
+  GROUP BY usage_month
+),
+
 -- (4) month_total mỗi tháng: ACTUAL nếu có; nếu không → ESTIMATED
 --     = TB 3 tháng ACTUAL gần nhất TRƯỚC tháng đó × %ngày đã qua
 month_totals AS (
   SELECT
     t.usage_month,
     a.storage_actual_total,
-    -- TB cộng 3 tháng actual gần nhất trước usage_month
-    (SELECT AVG(a3.storage_actual_total)
-     FROM (SELECT a2.storage_actual_total
-           FROM actual_by_month a2
-           WHERE a2.usage_month < t.usage_month
-           ORDER BY a2.usage_month DESC
-           LIMIT 3) a3)                                     AS avg_last_3_actual,
+    v.avg_last_3_actual,
     -- % ngày đã qua: tháng đã kết thúc → 1.0; tháng đang chạy → ngày đã qua/số ngày tháng
     CASE
       WHEN t.usage_month < DATE_TRUNC(CURRENT_DATE(), MONTH) THEN 1.0
@@ -97,6 +136,7 @@ month_totals AS (
     END                                                     AS pct_month_elapsed
   FROM driver_total t
   LEFT JOIN actual_by_month a USING (usage_month)
+  LEFT JOIN avg_last_3      v USING (usage_month)
 ),
 month_totals_final AS (
   SELECT
