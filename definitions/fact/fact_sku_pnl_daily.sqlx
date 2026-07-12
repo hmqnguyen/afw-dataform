@@ -185,6 +185,40 @@ returns_money AS (
   GROUP BY brand, sku, day
 ),
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   🔴 F17 (2026-07-12) — 3 NGUỒN CỦA FACT CÓ PHẠM VI NGÀY KHÁC NHAU.
+
+   Đo trên master thật:
+       orders           2025-03-01 → 2026-07-09    ← 16 THÁNG doanh thu
+       settlement       2026-04-10 → 2026-07-03    ← chỉ 3 THÁNG phí
+       settlement_fees  2026-04-10 → 2026-07-10    ← chỉ 3 THÁNG ads
+       returns_fbm      2025-03-28 → 2026-06-30    ✓
+       returns_fba      2025-08-06 → 2026-06-30    ✓
+
+   ⇒ 13 tháng (2025-03 → 2026-03) CÓ doanh thu, KHÔNG có một đồng phí nào.
+     (SettlementSync: `getReports` mặc định chỉ trả ~90 ngày — cần backfill
+      `--created-since`.)
+
+   Sau F16 (full-refresh dựng đủ lịch sử), nếu KHÔNG chặn thì:
+       margin(2025-06) = gross_revenue − 0 − 0 = gross_revenue  → BIÊN ~100%
+   Một báo cáo nói AFW lãi gần trọn doanh thu suốt 13 tháng. NGUY HIỂM HƠN cái
+   sai mà F16 vừa vá.
+
+   ⇒ NGUYÊN TẮC: NULL TỐT HƠN SỐ SAI.
+     Ngày nằm ngoài phạm vi settlement → margin = NULL, KHÔNG phải một con số
+     bịa. Cột `data_completeness` nói rõ vì sao.
+
+   ⚠️ Khi backfill settlement xong (SettlementSync --created-since 2025-03-01),
+      chạy lại full-refresh → margin TỰ ĐỘNG hiện ra cho các tháng cũ. Không
+      cần sửa code. Đây là lý do dùng ranh giới ĐỘNG (đọc từ master) thay vì
+      hằng số cứng.
+   ═══════════════════════════════════════════════════════════════════════════ */
+src_coverage AS (
+  SELECT
+    (SELECT MIN(posted_date) FROM ${ref("master_amazon_settlement")}) AS settlement_from,
+    (SELECT MAX(posted_date) FROM ${ref("master_amazon_settlement")}) AS settlement_to
+),
+
 combined AS (
   SELECT
     COALESCE(r.brand, f.brand, rt.brand)          AS brand,
@@ -276,18 +310,33 @@ SELECT
      dương) vẫn rơi vào commission_fee của NGÀY refund → margin ngày đó có phần
      dương nhỏ. Chấp nhận theo góc nhìn dòng tiền theo ngày.
      ═══════════════════════════════════════════════════════════════════════ */
-  (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
-    - COALESCE(commission_fee, 0)      * -1
-    - COALESCE(fba_fulfillment_fee, 0) * -1
-    -- 🔴 F9: BỎ `storage_fee` khỏi công thức — nó LUÔN = 0, trừ nó chỉ tạo
-    --        ẢO GIÁC là phí kho đã được tính. Storage thật: cấp tài khoản
-    --        (mart_amazon_channel_pnl_monthly) hoặc phân bổ theo cubic-foot-days
-    --        (mart_sku_storage_allocated). ĐỪNG thêm lại vào đây.
-    + COALESCE(safet_reimbursement, 0)
-    - COALESCE(return_label_cost, 0))      AS channel_contribution_margin_pre_cogs_pre_ads_pre_storage,
+  -- 🔴 F17 — margin CHỈ tính khi ngày đó NẰM TRONG phạm vi settlement.
+  --          Ngoài phạm vi → NULL. Số 0 phí là SAI, không phải "không có phí".
+  IF(c.settlement_from IS NULL OR day < c.settlement_from,
+     NULL,
+     (COALESCE(gross_revenue, 0) + COALESCE(shipping_revenue, 0)
+       - COALESCE(commission_fee, 0)      * -1
+       - COALESCE(fba_fulfillment_fee, 0) * -1
+       -- 🔴 F9: BỎ `storage_fee` khỏi công thức — nó LUÔN = 0, trừ nó chỉ tạo
+       --        ẢO GIÁC là phí kho đã được tính. Storage thật: cấp tài khoản
+       --        (mart_amazon_channel_pnl_monthly) hoặc phân bổ theo
+       --        cubic-foot-days (mart_sku_storage_allocated). ĐỪNG thêm lại.
+       + COALESCE(safet_reimbursement, 0)
+       - COALESCE(return_label_cost, 0))
+  )                                        AS channel_contribution_margin_pre_cogs_pre_ads_pre_storage,
+
+  -- 🔴 F17 — CỜ ĐỘ ĐẦY ĐỦ DỮ LIỆU. Mọi mart/báo cáo PHẢI đọc cột này.
+  (c.settlement_from IS NOT NULL AND day >= c.settlement_from)
+                                           AS has_settlement_data,
+  CASE
+    WHEN c.settlement_from IS NULL         THEN 'NO_SETTLEMENT_AT_ALL'
+    WHEN day < c.settlement_from           THEN 'REVENUE_ONLY'   -- ⚠️ margin = NULL
+    ELSE 'COMPLETE'
+  END                                      AS data_completeness,
 
   CURRENT_TIMESTAMP()                      AS _transformed_at
 FROM combined
+CROSS JOIN src_coverage c
 
 -- 🔴 F4b — MỘT mệnh đề WHERE duy nhất. Nhánh incremental nối bằng AND.
 WHERE sku IS NOT NULL

@@ -1,0 +1,89 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.staging_dataset,
+  name: "assert_data_freshness",
+  description: "CỜ ĐỎ: bảng theo-ngày ĐỨNG YÊN quá lâu ⇒ JOB SYNC ĐÃ CHẾT. assert_no_date_gaps MÙ với ca này (nó lấy MAX từ chính bảng → job chết thì MAX lùi theo → 'không có lỗ hổng').",
+  tags: ["assertion", "amazon", "data_quality", "freshness"]
+}
+
+/*
+  ═══════════════════════════════════════════════════════════════════════════
+  🔴 VÌ SAO CẦN — SỰ CỐ THẬT 2026-07-12
+
+  SalesTrafficSync NGỪNG CHẠY từ ~2026-07-01. Raw trống 9 NGÀY LIÊN TIẾP
+  (07-01 → 07-09). MAX(report_date) = 2026-06-30, trong khi hôm nay là 07-12.
+
+  ⇒ Kênh chiếm 60% doanh số KHÔNG CÓ DỮ LIỆU TRAFFIC suốt 12 ngày.
+  ⇒ assert_no_date_gaps VẪN XANH suốt thời gian đó.
+
+  LÝ DO ASSERTION KIA MÙ:
+      WITH bounds AS (SELECT MIN(report_date), MAX(report_date) FROM <chính bảng>)
+  Ranh giới lấy TỪ CHÍNH BẢNG. Job chết → MAX lùi theo → không còn "lỗ hổng"
+  nào ở giữa → assertion pass. Nó bắt được LỖ Ở GIỮA, nhưng mù với dạng hỏng
+  PHỔ BIẾN NHẤT: job đơn giản là ngừng chạy.
+
+  ⇒ Assertion này neo vào CURRENT_DATE(), không neo vào MAX của bảng.
+     Đó là toàn bộ điểm khác biệt.
+
+  ═══════════════════════════════════════════════════════════════════════════
+  NGƯỠNG — mỗi nguồn có độ trễ TỰ NHIÊN khác nhau. Ngưỡng = độ trễ + đệm.
+
+  | Bảng                          | Độ trễ tự nhiên            | Ngưỡng |
+  |-------------------------------|----------------------------|--------|
+  | sales_traffic_by_asin / _date | G4: Amazon restate 2-3 ngày|   4    |
+  |                               | + DataLagDays = 2          |        |
+  | inventory / inventory_planning| snapshot daily             |   2    |
+  | listings                      | snapshot daily             |   2    |
+  | inventory_ledger              | ledger daily, trễ ~1 ngày  |   3    |
+
+  ⚠️ ĐỪNG nới ngưỡng để "cho pipeline xanh". Assertion đỏ = job THẬT SỰ hỏng.
+     Nới ngưỡng = quay lại đúng trạng thái đã để job chết 12 ngày không ai biết.
+
+  ⚠️ KHÔNG áp cho settlement / returns / orders — dữ liệu theo SỰ KIỆN, ngày
+     không phát sinh giao dịch là bình thường.
+     (Settlement CÓ chu kỳ ~2 tuần → nếu muốn canh, ngưỡng phải là ~21 ngày,
+      và nên tách thành assertion riêng.)
+  ═══════════════════════════════════════════════════════════════════════════
+*/
+
+WITH freshness AS (
+  SELECT 'stg_amazon_sales_traffic_by_asin' AS table_name,
+         MAX(report_date)  AS last_date, 4 AS max_lag_days
+  FROM ${ref("stg_amazon_sales_traffic_by_asin")}
+  UNION ALL
+  SELECT 'stg_amazon_sales_traffic_by_date',
+         MAX(report_date), 4
+  FROM ${ref("stg_amazon_sales_traffic_by_date")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory',
+         MAX(snapshot_date), 2
+  FROM ${ref("stg_amazon_inventory")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory_planning',
+         MAX(snapshot_date), 2
+  FROM ${ref("stg_amazon_inventory_planning")}
+  UNION ALL
+  SELECT 'stg_amazon_listings',
+         MAX(snapshot_date), 2
+  FROM ${ref("stg_amazon_listings")}
+  UNION ALL
+  SELECT 'stg_amazon_inventory_ledger',
+         MAX(ledger_date), 3
+  FROM ${ref("stg_amazon_inventory_ledger")}
+)
+
+-- Assertion trả về CÁC DÒNG VI PHẠM. Rỗng = pass.
+SELECT
+  table_name,
+  last_date,
+  DATE_DIFF(CURRENT_DATE(), last_date, DAY) AS days_stale,
+  max_lag_days,
+  FORMAT(
+    '🔴 %s đứng yên %d ngày (ngưỡng %d). Job sync ĐÃ CHẾT — chạy lại và điều tra vì sao nó dừng.',
+    table_name,
+    DATE_DIFF(CURRENT_DATE(), last_date, DAY),
+    max_lag_days
+  ) AS action
+FROM freshness
+WHERE last_date IS NULL
+   OR DATE_DIFF(CURRENT_DATE(), last_date, DAY) > max_lag_days

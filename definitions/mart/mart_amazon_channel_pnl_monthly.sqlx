@@ -58,7 +58,10 @@ sku_level AS (
     SUM(refund_amount)                      AS refund_amount,
     SUM(safet_reimbursement)                AS safet_reimbursement,
     SUM(return_label_cost)                  AS return_label_cost,
-    COUNT(DISTINCT sku)                     AS active_sku_count
+    COUNT(DISTINCT sku)                     AS active_sku_count,
+    -- 🔴 F17 — tháng chỉ ĐẦY ĐỦ khi MỌI ngày trong tháng đều có nguồn settlement.
+    -- LOGICAL_AND: chỉ cần 1 ngày thiếu → cả tháng KHÔNG đầy đủ.
+    LOGICAL_AND(has_settlement_data)        AS month_is_complete
   FROM ${ref("fact_sku_pnl_daily")}
   GROUP BY 1, 2, 3
 ),
@@ -153,37 +156,67 @@ SELECT
   /* ── CM1: doanh thu − phí SKU. CHƯA trừ ads/storage/freight ──
      Đây là con số các báo cáo AFW hiện tại đang dùng. GIỮ LẠI để so sánh, và để
      nhìn thấy TẬN MẮT ads ăn bao nhiêu phần trăm của nó. */
-  (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
-    + COALESCE(s.commission_fee, 0)          -- đã âm
-    + COALESCE(s.fba_fulfillment_fee, 0)     -- đã âm
-    + COALESCE(s.other_fees, 0)
-    + COALESCE(s.safet_reimbursement, 0)
-    - COALESCE(s.return_label_cost, 0))                       AS cm1_pre_ads,
+  -- 🔴 F17 — NULL nếu tháng thiếu nguồn phí. SỐ 0 PHÍ LÀ SAI, không phải
+  --          "tháng đó không tốn phí". Xem cột data_completeness.
+  IF(NOT COALESCE(s.month_is_complete, FALSE), NULL,
+    (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+      + COALESCE(s.commission_fee, 0)          -- đã âm
+      + COALESCE(s.fba_fulfillment_fee, 0)     -- đã âm
+      + COALESCE(s.other_fees, 0)
+      + COALESCE(s.safet_reimbursement, 0)
+      - COALESCE(s.return_label_cost, 0))
+  )                                                           AS cm1_pre_ads,
 
   /* ── CM2: CM1 − ads − logistics − returns − tax. CON SỐ THẬT của kênh.
      Vẫn CHƯA trừ COGS (Nhà Máy 5 — chưa có nguồn). */
-  (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
-    + COALESCE(s.commission_fee, 0)
-    + COALESCE(s.fba_fulfillment_fee, 0)
-    + COALESCE(s.other_fees, 0)
-    + COALESCE(s.safet_reimbursement, 0)
-    - COALESCE(s.return_label_cost, 0)
-    + COALESCE(a.marketing_cost, 0)          -- đã âm
-    + COALESCE(a.logistics_cost, 0)          -- đã âm
-    + COALESCE(a.returns_cost, 0)
-    + COALESCE(a.tax_cost, 0))                                AS cm2_post_ads_pre_cogs,
+  IF(NOT COALESCE(s.month_is_complete, FALSE), NULL,
+    (COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+      + COALESCE(s.commission_fee, 0)
+      + COALESCE(s.fba_fulfillment_fee, 0)
+      + COALESCE(s.other_fees, 0)
+      + COALESCE(s.safet_reimbursement, 0)
+      - COALESCE(s.return_label_cost, 0)
+      + COALESCE(a.marketing_cost, 0)        -- đã âm
+      + COALESCE(a.logistics_cost, 0)        -- đã âm
+      + COALESCE(a.returns_cost, 0)
+      + COALESCE(a.tax_cost, 0))
+  )                                                           AS cm2_post_ads_pre_cogs,
 
   -- 🎯 CHỈ SỐ QUAN TRỌNG NHẤT: ad spend ăn bao nhiêu % CM1.
   --    Kỳ vọng ~79% theo phát hiện nghiệp vụ. > 100% ⇒ kênh LỖ ở phần trả phí.
-  ROUND(SAFE_DIVIDE(ABS(COALESCE(a.ad_spend, 0)),
-        NULLIF((COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
-                + COALESCE(s.commission_fee, 0) + COALESCE(s.fba_fulfillment_fee, 0)
-                + COALESCE(s.other_fees, 0) + COALESCE(s.safet_reimbursement, 0)
-                - COALESCE(s.return_label_cost, 0)), 0)) * 100, 1)
-                                                              AS ad_spend_pct_of_cm1,
+  /* 🔴 F17 + ⚠️ CẢNH BÁO DIỄN GIẢI:
+     Chỉ tính khi tháng ĐẦY ĐỦ. Nhưng NGAY CẢ KHI ĐẦY ĐỦ, con số này VẪN CHƯA
+     ĐÁNG TIN, vì mẫu số `cm1_pre_ads` CHƯA TRỪ COGS (Nhà Máy 5 — chưa có nguồn).
+
+     Đo thật 2026-06: rev=304,013 · margin=234,833 → biên 77%. Biên 77% cho một
+     hãng nội thất là BẤT KHẢ THI ⇒ mẫu số đang bị thổi phồng ⇒ ad_spend_pct
+     trông NHỎ HƠN thực tế rất nhiều (23.6% thay vì mức ~79% đã ghi nhận).
+
+     ⇒ ĐỪNG đưa con số này cho leadership cho tới khi có `unit_cost` từ Airtable.
+       Nó đang TRẤN AN NHẦM. */
+  IF(NOT COALESCE(s.month_is_complete, FALSE), NULL,
+    ROUND(SAFE_DIVIDE(ABS(COALESCE(a.ad_spend, 0)),
+          NULLIF((COALESCE(s.gross_revenue, 0) + COALESCE(s.shipping_revenue, 0)
+                  + COALESCE(s.commission_fee, 0) + COALESCE(s.fba_fulfillment_fee, 0)
+                  + COALESCE(s.other_fees, 0) + COALESCE(s.safet_reimbursement, 0)
+                  - COALESCE(s.return_label_cost, 0)), 0)) * 100, 1)
+  )                                                           AS ad_spend_pct_of_cm1,
 
   ROUND(SAFE_DIVIDE(ABS(COALESCE(a.ad_spend, 0)),
         NULLIF(COALESCE(s.gross_revenue, 0), 0)) * 100, 2)    AS acos_pct,  -- ad spend / doanh thu
+
+  -- ── 🔴 F17 — CỜ ĐỘ ĐẦY ĐỦ. ĐỌC CỘT NÀY TRƯỚC KHI ĐỌC BẤT KỲ SỐ NÀO KHÁC.
+  CASE
+    WHEN s.month IS NULL                             THEN 'FEES_ONLY_NO_REVENUE'
+    WHEN a.month IS NULL                             THEN 'REVENUE_ONLY_NO_FEES'
+    WHEN NOT COALESCE(s.month_is_complete, FALSE)    THEN 'PARTIAL_SETTLEMENT'
+    ELSE 'COMPLETE'
+  END                                                         AS data_completeness,
+  CASE
+    WHEN NOT COALESCE(s.month_is_complete, FALSE)
+      THEN '⚠️ Tháng này THIẾU nguồn settlement (phí/ads). cm1/cm2/ad_pct = NULL có chủ ý. Backfill: SettlementSync --created-since'
+    ELSE 'OK'
+  END                                                         AS completeness_note,
 
   -- ── Đối soát & cờ đỏ
   COALESCE(a.excluded_amount, 0)                              AS excluded_amount,   -- KHÔNG dùng cho margin
