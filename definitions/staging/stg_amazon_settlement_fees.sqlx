@@ -6,7 +6,7 @@ config {
     nonNull: ["fee_key", "posted_date"]
   },
   uniqueKey: ["fee_key"],
-  description: "Staging phí settlement CẤP TÀI KHOẢN (dòng sku IS NULL) — grain bị stg_amazon_settlement cố ý lọc bỏ. Nguồn để mart phân bổ (storage, subscription, ads...) mà KHÔNG phải đọc raw (invariant I1).",
+  description: "Staging phí settlement CẤP TÀI KHOẢN (dòng sku IS NULL) — grain bị stg_amazon_settlement cố ý lọc bỏ. Nguồn cho mọi mart phân bổ chi phí (storage, ads, freight) mà KHÔNG phải đọc raw (invariant I1). F10/F11/F12 fix 2026-07-12.",
   tags: ["staging", "amazon", "settlement_fees"],
   bigquery: { partitionBy: "posted_date", clusterBy: ["cost_group"] }
 }
@@ -19,43 +19,167 @@ pre_operations {
   )
 }
 
--- Vì sao tồn tại bảng này (I1 root-cause):
---   mart_sku_storage_allocated cần TỔNG storage thật, nhưng dòng storage trong
---   settlement KHÔNG có sku → bị stg_amazon_settlement lọc (WHERE sku IS NOT NULL).
---   Thay vì để mart đọc raw (vi phạm I1), tạo staging riêng cho GRAIN BỊ RƠI.
---
--- G7 (NULL-safe dedup key): sku NULL → không dùng được làm khoá. Dựng fee_key
---   tổng hợp từ các trường luôn có, COALESCE mọi thành phần có thể NULL.
-WITH parsed AS (
+/* ═══════════════════════════════════════════════════════════════════════════
+   VÌ SAO TỒN TẠI BẢNG NÀY (I1 root-cause)
+     mart_sku_storage_allocated cần TỔNG storage thật, nhưng dòng storage trong
+     settlement KHÔNG có sku → bị stg_amazon_settlement lọc. Thay vì để mart đọc
+     raw (vi phạm I1), tạo staging riêng cho GRAIN BỊ RƠI.
+
+   ⚠️ BẢNG NÀY VÀ stg_amazon_settlement LÀ PHẦN BÙ CHÍNH XÁC CỦA NHAU.
+      Cả hai PHẢI dùng CÙNG một vị từ, chỉ đảo IS NULL / IS NOT NULL:
+          settlement       :  NULLIF(TRIM(sku), '') IS NOT NULL
+          settlement_fees  :  NULLIF(TRIM(sku), '') IS     NULL
+      Lệch vị từ → dòng nằm ở CẢ HAI (đếm đôi chi phí) hoặc RƠI KHỎI CẢ HAI.
+
+   ═══════════════════════════════════════════════════════════════════════════
+   🔴 I7 — Ô RỖNG TRONG PIPELINE NÀY LÀ `''`, KHÔNG PHẢI `NULL`
+
+   TsvParser ghi ô TSV trống thành "" vào raw_payload. Mọi kiểm tra "field này
+   có giá trị không" PHẢI dùng NULLIF(TRIM(x), '') IS NOT NULL.
+   `x IS NOT NULL` LUÔN TRẢ TRUE cho ô rỗng → bộ lọc không lọc được gì.
+
+   Đã dính 3 lần:
+     • bug #4  — Returns FBM: ô rỗng là ' ' (DẤU CÁCH) → NULLIF(x,'') không bắt
+     • F11     — Settlement: header có amount-type = '' → 17 dòng header lọt vào
+                 bảng này (510 thay vì 493)
+     • F11b    — vị từ lọc sku lệch nhau giữa 2 staging → nguy cơ đếm đôi
+   ⇒ Rà Wayfair / Shopify / Lecangs: gần như chắc chắn cùng dính.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- (1) all_rows — parse MỌI dòng, KHÔNG lọc gì.
+--     ⚠️ BẮT BUỘC giữ dòng HEADER ở bước này: header là nơi DUY NHẤT mang
+--        settlement-start/end-date. F12 cần nó để broadcast ngày xuống các dòng
+--        phí không có ngày. Lọc header ở đây = mất luôn nguồn ngày.
+-- ─────────────────────────────────────────────────────────────────────────────
+WITH all_rows AS (
   SELECT
     brand,
     JSON_VALUE(raw_payload, '$."settlement-id"')                        AS settlement_id,
+    JSON_VALUE(raw_payload, '$.sku')                                    AS sku_raw,
     JSON_VALUE(raw_payload, '$."transaction-type"')                     AS transaction_type,
     JSON_VALUE(raw_payload, '$."amount-type"')                          AS amount_type,
     JSON_VALUE(raw_payload, '$."amount-description"')                   AS amount_description,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$.amount') AS NUMERIC)            AS amount,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.amount') AS NUMERIC)           AS amount,
     JSON_VALUE(raw_payload, '$."order-id"')                             AS amazon_order_id,
-    SAFE.PARSE_DATE('%Y-%m-%d', JSON_VALUE(raw_payload, '$."posted-date"')) AS posted_date,
-    SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP)  AS posted_date_time,
+
+    -- 3 nguồn ngày CÓ THỂ CÓ trên chính dòng đó
+    SAFE_CAST(JSON_VALUE(raw_payload, '$."posted-date-time"') AS TIMESTAMP) AS posted_date_time,
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      JSON_VALUE(raw_payload, '$."posted-date"'))                       AS posted_date_field,
+    SAFE.PARSE_DATE('%Y-%m-%d',
+      SUBSTR(JSON_VALUE(raw_payload, '$."settlement-end-date"'), 1, 10)) AS settlement_end_date,
+
     _ingested_at
   FROM ${ref("raw_amazon_settlement")}
   WHERE brand = 'AFW'
-    -- CHỈ dòng KHÔNG có sku (phần bù của stg_amazon_settlement)
-    AND (JSON_VALUE(raw_payload, '$.sku') IS NULL OR JSON_VALUE(raw_payload, '$.sku') = '')
-    -- bỏ dòng HEADER (không có amount-type, chỉ mang total-amount)
-    AND JSON_VALUE(raw_payload, '$."amount-type"') IS NOT NULL
     AND _ingested_at > ingested_at_checkpoint
 ),
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- (2) 🔴 F12 — BROADCAST ngày kỳ settlement từ dòng HEADER xuống mọi dòng cùng
+--     settlement_id. Cùng pattern với CTE `enriched` của stg_amazon_settlement.
+--
+--     LÝ DO (data thật 2026-07-12): 14 dòng phí THẬT không có ngày ở BẤT KỲ đâu
+--     trên chính nó — posted-date, posted-date-time, settlement-end-date đều rỗng:
+--         other-transaction · Subscription Fee     6 dòng  −$403.46
+--         other-transaction · Payable to Amazon    5 dòng  −$193.11
+--         other-transaction · Successful charge    3 dòng  +$55.94
+--     Cả 3 nhóm đều là cost_group='EXCLUDED' (KHÔNG vào margin) → P&L KHÔNG SAI
+--     vì chúng. NHƯNG posted_date là PARTITION KEY: NULL → dồn vào partition
+--     __NULL__ → biến mất khỏi đối soát payout — mà đối soát payout chính là lý
+--     do DUY NHẤT giữ nhóm EXCLUDED lại.
+--
+--     ⚠️ ĐIỀU KIỆN ĐỂ BROADCAST ĐÚNG: header và dòng phí của cùng 1 settlement
+--        phải nằm TRONG CÙNG BATCH incremental. Hiện ĐÚNG, vì SettlementSync nạp
+--        TRỌN 1 report/1 lần → mọi dòng cùng report có cùng _ingested_at.
+--        Nếu sau này đổi sang nạp từng phần → broadcast HỎNG. Đừng đổi.
+-- ─────────────────────────────────────────────────────────────────────────────
+broadcast AS (
+  SELECT
+    *,
+    MAX(settlement_end_date) OVER (PARTITION BY settlement_id) AS settlement_end_date_hdr
+  FROM all_rows
+),
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- (3) parsed — GIỜ mới lọc: chỉ dòng cấp tài khoản, bỏ header.
+-- ─────────────────────────────────────────────────────────────────────────────
+parsed AS (
+  SELECT
+    brand,
+    settlement_id,
+    transaction_type,
+    amount_type,
+    amount_description,
+    amount,
+    amazon_order_id,
+
+    /* 🔴 F10 — posted_date: chuỗi fallback 4 tầng.
+       Ưu tiên `posted-date-time` để KHỚP stg_amazon_settlement (bảng kia lấy
+       posted_date = DATE(posted-date-time)). Bản cũ dùng `posted-date` → hai
+       staging CÙNG ĐỌC MỘT RAW mà dùng HAI FIELD khác nhau cho cùng khái niệm
+       → ngày có thể lệch, mọi đối soát settlement ↔ settlement_fees sẽ sai. */
+    COALESCE(
+      DATE(posted_date_time),      -- (1) nguồn quyền uy, khớp stg_amazon_settlement
+      posted_date_field,           -- (2) field `posted-date` (479/510 dòng có)
+      settlement_end_date,         -- (3) ngày chốt kỳ trên chính dòng đó
+      settlement_end_date_hdr      -- (4) 🔴 F12: kéo từ dòng HEADER cùng settlement
+    )                                                                   AS posted_date,
+
+    -- Fallback nào đã dùng — KHÔNG BAO GIỜ sửa số âm thầm.
+    -- 'SETTLEMENT_HEADER' = 14 dòng other-transaction nói trên. Kỳ vọng ĐÚNG 14.
+    -- 'NONE'              = 🚨 còn dòng không có ngày ở đâu cả → assertion nonNull FAIL.
+    CASE
+      WHEN posted_date_time        IS NOT NULL THEN 'POSTED_DATE_TIME'
+      WHEN posted_date_field       IS NOT NULL THEN 'POSTED_DATE'
+      WHEN settlement_end_date     IS NOT NULL THEN 'SETTLEMENT_END_DATE'
+      WHEN settlement_end_date_hdr IS NOT NULL THEN 'SETTLEMENT_HEADER'
+      ELSE 'NONE'
+    END                                                                 AS posted_date_source,
+
+    posted_date_time,
+    _ingested_at
+  FROM broadcast
+  WHERE
+    -- CHỈ dòng KHÔNG có sku (phần bù CHÍNH XÁC của stg_amazon_settlement)
+    NULLIF(TRIM(sku_raw), '') IS NULL
+
+    /* 🔴 F11 — BỘ LỌC HEADER CŨ (`amount-type IS NOT NULL`) KHÔNG LỌC ĐƯỢC GÌ.
+       Header có amount-type = '' (chuỗi rỗng, không phải NULL) → '' IS NOT NULL
+       = TRUE → 17 dòng header LỌT HẾT.
+
+       Bằng chứng data thật:
+           dòng sku-null với bộ lọc CŨ = 510   (= 17 header + 493 phí)
+           kỳ vọng                      = 493
+           dòng có posted-date = ''     =  17   ← khớp CHÍNH XÁC 17 header
+
+       Hệ quả dây chuyền của 17 dòng rác đó:
+         • amount_type='' + amount_description='' → không khớp nhánh taxonomy
+           nào → cost_group='UNMAPPED' → assert_settlement_fees_no_unmapped FAIL.
+           (Bảng "UNMAPPED = 0 ✓" trong handoff được kiểm trên 493 dòng LỌC TAY,
+            không phải trên output THẬT của staging.)
+         • posted-date='' → posted_date NULL → assertion rowConditions FAIL.
+           ĐÂY LÀ LỖI GẶP KHI CHẠY.
+         • amount='' → NULL → SUM(amount) theo cost_group lệch. */
+    AND NULLIF(TRIM(amount_type), '') IS NOT NULL
+),
+
 keyed AS (
   SELECT
     *,
     -- fee_key: NULL-safe surrogate key (G7)
+    -- ⚠️ posted_date_time NULL ở 14 dòng other-transaction → thành phần thời gian
+    --    của khoá mất tác dụng ở nhóm đó. Chúng vẫn phân biệt được nhờ
+    --    (settlement_id, amount_description, amount). Assertion uniqueKey canh
+    --    va chạm — nếu FAIL, phải thêm ordinal khi ingest (sửa C# SettlementSync).
     TO_HEX(MD5(CONCAT(
       COALESCE(settlement_id,''), '|', COALESCE(transaction_type,''), '|',
       COALESCE(amount_type,''),   '|', COALESCE(amount_description,''), '|',
       COALESCE(amazon_order_id,''),'|', COALESCE(CAST(amount AS STRING),''), '|',
       COALESCE(CAST(posted_date_time AS STRING),'')
     )))                                                                  AS fee_key,
+
     -- ── cost_group: TAXONOMY DỰNG TỪ DATA THẬT (493 dòng, 2026-07-12) ──
     --
     -- ⚠️ PHẢI SOI `amount_type` TRƯỚC, RỒI MỚI `amount_description`.
@@ -89,11 +213,13 @@ keyed AS (
       WHEN amount_type = 'ItemWithheldTax'                                 THEN 'TAX'
 
       -- EXCLUDED — KHÔNG phải chi phí vận hành, KHÔNG được cộng vào P&L:
-      --   Reserve = tiền Amazon tạm giữ (chỉ là dòng tiền, không phải chi phí).
+      --   Reserve = tiền Amazon TẠM GIỮ (chỉ là dòng tiền, không phải chi phí).
       --     'Previous Reserve Amount Balance' +$118,227 / 'Current Reserve Amount'
       --     −$59,875 — cộng vào sẽ làm P&L SAI LỆCH KHỔNG LỒ.
-      --   Subscription = phí tài khoản (chi phí cố định, tách riêng).
-      --   Payable to Amazon / Successful charge = cơ chế thanh toán.
+      --   Subscription Fee (6 dòng, −$403.46) = phí tài khoản, chi phí CỐ ĐỊNH.
+      --   Payable to Amazon (5, −$193.11) / Successful charge (3, +$55.94)
+      --     = cơ chế THANH TOÁN, không phải chi phí.
+      --   ⚠️ ĐÚNG 14 dòng này là nhóm KHÔNG CÓ NGÀY → dùng fallback SETTLEMENT_HEADER.
       WHEN LOWER(amount_description) LIKE '%reserve%'                      THEN 'EXCLUDED'
       WHEN LOWER(amount_description) LIKE '%subscription%'                 THEN 'EXCLUDED'
       WHEN LOWER(amount_description) LIKE '%base fee%'                     THEN 'EXCLUDED'
@@ -102,13 +228,16 @@ keyed AS (
       WHEN LOWER(amount_description) LIKE '%adjustment%'                   THEN 'EXCLUDED'
       WHEN amount_type = 'ItemPrice'                                       THEN 'EXCLUDED'
 
-      -- Amazon thêm loại phí mới → rơi vào đây. Cờ ĐỎ: query UNMAPPED định kỳ.
+      -- Amazon thêm loại phí mới → rơi vào đây.
+      -- Cờ ĐỎ: assertion assert_settlement_fees_no_unmapped canh cái này.
       ELSE 'UNMAPPED'
     END                                                                  AS cost_group
   FROM parsed
 ),
+
 ranked AS (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY fee_key ORDER BY _ingested_at DESC) AS rn
   FROM keyed
 )
+
 SELECT * EXCEPT(rn) FROM ranked WHERE rn = 1

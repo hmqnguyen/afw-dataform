@@ -174,7 +174,24 @@ keyed AS (
       COALESCE(CAST(posted_date_time AS STRING),   '~NULL~')
     ], '|'))) AS settlement_key
   FROM enriched
-  WHERE sku IS NOT NULL AND sku != ''
+  /* 🔴 F11b (2026-07-12) — PHẢI LÀ PHẦN BÙ CHÍNH XÁC của stg_amazon_settlement_fees.
+
+     BẢN CŨ:  WHERE sku IS NOT NULL AND sku != ''
+     Bên fees: WHERE NULLIF(TRIM(sku), '') IS NULL
+
+     KHÔNG bù nhau. Với sku = ' ' (một dấu cách):
+       settlement:  ' ' IS NOT NULL AND ' ' != ''      → TRUE  → dòng VÀO ĐÂY
+       fees:        NULLIF(TRIM(' '), '') IS NULL      → TRUE  → dòng CŨNG VÀO ĐÓ
+     ⇒ CÙNG MỘT DÒNG nằm ở CẢ HAI bảng → fact cộng phí 1 lần, mart cấp kênh
+       cộng lần nữa → ĐẾM ĐÔI CHI PHÍ.
+     (Và một sku toàn khoảng trắng thì lại RƠI RA KHỎI cả hai nếu viết ngược lại.)
+
+     ⇒ Dùng CHUNG một vị từ, chỉ đảo IS NULL / IS NOT NULL.
+
+     ⚠️ TRIM ở đây CHỈ dùng trong VỊ TỪ LỌC — cột `sku` vẫn lưu NGUYÊN VĂN (I5).
+        'FBA- 901210' có dấu cách GIỮA chuỗi → TRIM không đụng tới → vẫn vào đây,
+        vẫn lưu nguyên dấu cách. KHÔNG được TRIM giá trị sku khi ghi. */
+  WHERE NULLIF(TRIM(sku), '') IS NOT NULL
 ),
 
 ranked AS (
