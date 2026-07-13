@@ -1,0 +1,14 @@
+{
+  "_comment": "ACCOUNT 2 - PROD (project allforwood). Cung repo/model, vars -> afw_amz_a2_*. Khac a2.json o cho defaultProject = allforwood (prod) thay vi allforwood-dev (dev). Account/prod-dev doc lap: dev-a1=dev.json, prod-a1=prod.json, dev-a2=a2.json, prod-a2=a2_prod.json.",
+  "defaultProject": "allforwood",
+  "defaultDataset": "afw_amz_a2_fact",
+  "defaultLocation": "US",
+  "defaultAssertionDataset": "afw_amz_a2_fact",
+  "vars": {
+    "raw_dataset":     "afw_amz_a2_raw",
+    "staging_dataset": "afw_amz_a2_staging",
+    "fact_dataset":    "afw_amz_a2_fact",
+    "master_dataset":  "afw_amz_a2_master",
+    "mart_dataset":    "afw_amz_a2_mart"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "_comment": "ACCOUNT 2 (dev project allforwood-dev). Cung repo/model voi account 1, chi khac vars -> dataset afw_amz_a2_*. Account 1 chay bang dev.json (khong doi). Prod account 2: tao them a2_prod.json (defaultProject=allforwood).",
+  "defaultProject": "allforwood-dev",
+  "defaultDataset": "afw_amz_a2_fact",
+  "defaultLocation": "US",
+  "defaultAssertionDataset": "afw_amz_a2_fact",
+  "vars": {
+    "raw_dataset":     "afw_amz_a2_raw",
+    "staging_dataset": "afw_amz_a2_staging",
+    "fact_dataset":    "afw_amz_a2_fact",
+    "master_dataset":  "afw_amz_a2_master",
+    "mart_dataset":    "afw_amz_a2_mart"
+  }
+}

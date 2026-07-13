@@ -1,0 +1,74 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.master_dataset,
+  name: "assert_no_date_gaps_master",
+  description: "T-02: PHAT HIEN LO HONG NGAY o tang MASTER (assert_no_date_gaps chi doc STAGING). Neu staging bi loc/loi khien master hut ngay o GIUA -> bat o day. FAIL neu co ngay thieu -> pipeline dung, khong de mart tinh sai tren master thung.",
+  tags: ["assertion", "amazon", "data_quality", "master"]
+}
+
+/*
+  VI SAO CAN (T-02): assert_no_date_gaps chi kiem STAGING. Master la noi mart/fact
+  THAT SU doc (I1). Neu 1 buoc master (MERGE/incremental) lam hut ngay ma staging
+  van du, assertion cu KHONG bat duoc -> mart tinh tren master thung.
+
+  CHI ap cho master snapshot DAILY co ngay LIEN TUC:
+    master_amazon_inventory / _planning / _listings  -> snapshot_date
+    master_amazon_inventory_ledger                    -> ledger_date
+  KHONG ap master_amazon_storage_fees (grain THANG: month_of_charge — khong lien tuc theo ngay).
+  KHONG ap orders/settlement/returns (du lieu theo SU KIEN).
+
+  Dung TOAN BO lich su (moi snapshot_date), KHONG loc is_latest — muc tieu la
+  moi ngay giua min..max deu phai co du lieu.
+
+  Assertion tra ve CAC DONG VI PHAM (ngay thieu). Rong = pass.
+*/
+
+WITH bounds AS (
+  SELECT 'master_amazon_inventory' AS table_name,
+         MIN(snapshot_date) AS min_d, MAX(snapshot_date) AS max_d
+  FROM ${ref("master_amazon_inventory")}
+  UNION ALL
+  SELECT 'master_amazon_inventory_planning',
+         MIN(snapshot_date), MAX(snapshot_date)
+  FROM ${ref("master_amazon_inventory_planning")}
+  UNION ALL
+  SELECT 'master_amazon_listings',
+         MIN(snapshot_date), MAX(snapshot_date)
+  FROM ${ref("master_amazon_listings")}
+  UNION ALL
+  SELECT 'master_amazon_inventory_ledger',
+         MIN(ledger_date), MAX(ledger_date)
+  FROM ${ref("master_amazon_inventory_ledger")}
+),
+
+-- Ngay DA CO trong tung bang master
+actual AS (
+  SELECT 'master_amazon_inventory' AS table_name, snapshot_date AS d
+  FROM ${ref("master_amazon_inventory")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'master_amazon_inventory_planning', snapshot_date
+  FROM ${ref("master_amazon_inventory_planning")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'master_amazon_listings', snapshot_date
+  FROM ${ref("master_amazon_listings")} GROUP BY 1, 2
+  UNION ALL
+  SELECT 'master_amazon_inventory_ledger', ledger_date
+  FROM ${ref("master_amazon_inventory_ledger")} GROUP BY 1, 2
+),
+
+-- Toan bo ngay DANG LE phai co (min -> max cua chinh bang do)
+expected AS (
+  SELECT b.table_name, d
+  FROM bounds b, UNNEST(GENERATE_DATE_ARRAY(b.min_d, b.max_d)) AS d
+  WHERE b.min_d IS NOT NULL
+)
+
+-- VI PHAM = ngay trong khoang nhung KHONG co du lieu
+SELECT
+  e.table_name,
+  e.d AS missing_date
+FROM expected e
+LEFT JOIN actual a
+  ON a.table_name = e.table_name AND a.d = e.d
+WHERE a.d IS NULL
+ORDER BY e.table_name, e.d

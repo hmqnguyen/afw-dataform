@@ -46,30 +46,30 @@ SELECT
   report_id,
 
   -- SALES
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSales.amount')    AS NUMERIC) AS ordered_product_sales,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSales.amount')    AS NUMERIC) AS ordered_product_sales,
   JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSales.currencyCode')               AS currency_code,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSalesB2B.amount') AS NUMERIC) AS ordered_product_sales_b2b,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrdered')                  AS INT64)   AS units_ordered,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrderedB2B')               AS INT64)   AS units_ordered_b2b,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.totalOrderItems')               AS INT64)   AS total_order_items,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.averageSellingPrice.amount')    AS NUMERIC) AS avg_selling_price,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsRefunded')                 AS INT64)   AS units_refunded,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.refundRate')                    AS FLOAT64) AS refund_rate_pct,
-  CAST(JSON_VALUE(raw_payload, '$.salesByDate.claimsGranted')                 AS INT64)   AS claims_granted,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.orderedProductSalesB2B.amount') AS NUMERIC) AS ordered_product_sales_b2b,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrdered')                  AS INT64)   AS units_ordered,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsOrderedB2B')               AS INT64)   AS units_ordered_b2b,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.totalOrderItems')               AS INT64)   AS total_order_items,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.averageSellingPrice.amount')    AS NUMERIC) AS avg_selling_price,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.unitsRefunded')                 AS INT64)   AS units_refunded,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.refundRate')                    AS FLOAT64) AS refund_rate_pct,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByDate.claimsGranted')                 AS INT64)   AS claims_granted,
 
   -- TRAFFIC
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.sessions')                    AS INT64)   AS sessions,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.browserSessions')             AS INT64)   AS browser_sessions,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.mobileAppSessions')           AS INT64)   AS mobile_app_sessions,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.pageViews')                   AS INT64)   AS page_views,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.sessions')                    AS INT64)   AS sessions,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.browserSessions')             AS INT64)   AS browser_sessions,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.mobileAppSessions')           AS INT64)   AS mobile_app_sessions,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.pageViews')                   AS INT64)   AS page_views,
 
   -- 3 chi so vang
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.buyBoxPercentage')            AS FLOAT64) AS buy_box_pct,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.unitSessionPercentage')       AS FLOAT64) AS unit_session_pct,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.orderItemSessionPercentage')  AS FLOAT64) AS order_item_session_pct,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.buyBoxPercentage')            AS FLOAT64) AS buy_box_pct,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.unitSessionPercentage')       AS FLOAT64) AS unit_session_pct,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.orderItemSessionPercentage')  AS FLOAT64) AS order_item_session_pct,
 
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.averageOfferCount')           AS INT64)   AS avg_offer_count,
-  CAST(JSON_VALUE(raw_payload, '$.trafficByDate.negativeFeedbackReceived')    AS INT64)   AS negative_feedback,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.averageOfferCount')           AS INT64)   AS avg_offer_count,
+  SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByDate.negativeFeedbackReceived')    AS INT64)   AS negative_feedback,
 
   _ingested_at
 

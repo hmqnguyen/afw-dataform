@@ -65,23 +65,23 @@ WITH parsed AS (
     ) AS dedup_key,
 
     -- SALES
-    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrdered')               AS INT64)   AS units_ordered,
-    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrderedB2B')            AS INT64)   AS units_ordered_b2b,
-    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.orderedProductSales.amount') AS NUMERIC) AS ordered_product_sales,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrdered')               AS INT64)   AS units_ordered,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByAsin.unitsOrderedB2B')            AS INT64)   AS units_ordered_b2b,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByAsin.orderedProductSales.amount') AS NUMERIC) AS ordered_product_sales,
     JSON_VALUE(raw_payload, '$.salesByAsin.orderedProductSales.currencyCode')            AS currency_code,
-    CAST(JSON_VALUE(raw_payload, '$.salesByAsin.totalOrderItems')            AS INT64)   AS total_order_items,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.salesByAsin.totalOrderItems')            AS INT64)   AS total_order_items,
 
     -- TRAFFIC
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessions')                 AS INT64)   AS sessions,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.browserSessions')          AS INT64)   AS browser_sessions,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.mobileAppSessions')        AS INT64)   AS mobile_app_sessions,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViews')                AS INT64)   AS page_views,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessionPercentage')        AS FLOAT64) AS session_share_pct,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViewsPercentage')      AS FLOAT64) AS page_view_share_pct,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessions')                 AS INT64)   AS sessions,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.browserSessions')          AS INT64)   AS browser_sessions,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.mobileAppSessions')        AS INT64)   AS mobile_app_sessions,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViews')                AS INT64)   AS page_views,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.sessionPercentage')        AS FLOAT64) AS session_share_pct,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.pageViewsPercentage')      AS FLOAT64) AS page_view_share_pct,
 
     -- 2 chi so quyet dinh
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.buyBoxPercentage')         AS FLOAT64) AS buy_box_pct,
-    CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.unitSessionPercentage')    AS FLOAT64) AS unit_session_pct
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.buyBoxPercentage')         AS FLOAT64) AS buy_box_pct,
+    SAFE_CAST(JSON_VALUE(raw_payload, '$.trafficByAsin.unitSessionPercentage')    AS FLOAT64) AS unit_session_pct
 
   FROM ${ref("raw_amazon_sales_traffic_by_asin")}
   WHERE brand = 'AFW'
